@@ -1,0 +1,2259 @@
+local VERSION = "2.7.3"
+
+local letters = {"A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z"}
+local userCooldowns = {}
+local currentQuestion
+local questionAnsweredBy
+local quizRunning = false
+local HttpService = game:GetService("HttpService")
+local players = game:GetService("Players")
+local localPlayer = players.LocalPlayer
+local blockedPlayers = {}
+local whiteListedplayers = {}
+local mode = "Quiz"
+local answeredCorrectly = {}
+local submittedAnswer = {}
+local awaitingAnswer = false
+local questionPoints = 1
+local timeSinceLastMessage = tick()
+local placeId = game.PlaceId
+local replicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local textChatService = game:GetService("TextChatService")
+local quizCooldown = false
+local answerOptionsSaid = 0
+local minMessageCooldown = 2.3
+local whiteListEnabled = false
+local ContextActionService = game:GetService("ContextActionService")
+local UserInputService = game:GetService("UserInputService")
+
+local settings = {
+    questionTimeout = 10,
+    userCooldown = 5,
+    sendLeaderBoardAfterQuestions = 0,
+    automaticLeaderboards = true,
+    automaticCurrentQuizLeaderboard = false,
+    automaticServerQuizLeaderboard = true,
+    signStatus = true,
+    boothStatus = true,
+    boothGameFullMode = false,
+    boothGameSuppressNotifs = true,
+    romanNumbers = false,
+    disableChat = false,
+    autoplay = false,
+    repeatTagged = true,
+    sendDetailedCategorylist = false,
+    removeLeavingPlayersFromLB = true,
+}
+
+local numberMap = {
+    {1000, 'M'},
+    {900, 'CM'},
+    {500, 'D'},
+    {400, 'CD'},
+    {100, 'C'},
+    {90, 'XC'},
+    {50, 'L'},
+    {40, 'XL'},
+    {10, 'X'},
+    {9, 'IX'},
+    {5, 'V'},
+    {4, 'IV'},
+    {1, 'I'}
+}
+
+function intToRoman(num)
+    local roman = ""
+    while num > 0 do
+        for _, v in pairs(numberMap)do
+            local romanChar = v[2]
+            local int = v[1]
+            while num >= int do
+                roman = roman..romanChar
+                num = num - int
+            end
+        end
+    end
+    return roman
+end
+
+local function Chat(msg, force)
+    if settings.disableChat and not force then
+        return
+    end
+    textChatService.TextChannels.RBXGeneral:SendAsync(msg)
+end
+
+local function shuffle(tbl)
+    local rng = Random.new()
+    for i = #tbl, 2, -1 do
+        local j = rng:NextInteger(1, i)
+        tbl[i], tbl[j] = tbl[j], tbl[i]
+    end
+    return tbl
+end
+
+local function sortAlphabetically(a, b)
+    return string.lower(a) < string.lower(b)
+end
+
+local function roundNumber(num, numDecimalPlaces)
+    return tonumber(string.format("%." .. (numDecimalPlaces or 0) .. "f", num))
+end
+
+local notifyBindable = Instance.new("BindableFunction")
+local function notify(title: string, text: string, configTable: { any }?, duration: number?)
+    configTable = configTable or {}
+    StarterGui:SetCore("SendNotification", {
+        Title = title,
+        Text = text,
+        Callback = notifyBindable,
+        Button1 = configTable.Button1,
+        Button2 = configTable.Button2,
+        Duration = duration
+    })
+    if configTable.Callback then
+        notifyBindable.OnInvoke = configTable.Callback
+    end
+end
+
+local function setgenv(key: string, value: any)
+    pcall(function()
+        getgenv()[key] = value
+    end)
+end
+
+if getgenv and getgenv().QUIZBOT_RUNNING then
+    notify("quizbot já está em execução", "Você não pode executar duas instâncias do quizbot ao mesmo tempo")
+    return
+end
+setgenv("QUIZBOT_RUNNING", true)
+
+local function copyLatestScript()
+    setclipboard('loadstring(game:HttpGet("https://raw.githubusercontent.com/Damian-11/quizbot/master/quizbot.luau", true))()')
+    notify("Script copiado", "A versão mais recente do quizbot foi copiada para a sua área de transferência")
+end
+
+local DATA_FILENAME = "quizbot_data.json"
+type dataValueType = string | number | boolean
+local data: {[string]: dataValueType} = {}
+if isfile and isfile(DATA_FILENAME) then
+    data = HttpService:JSONDecode(readfile(DATA_FILENAME))
+end
+
+local function writeToDataFile(key: string, value: dataValueType)
+    if not writefile then
+        notify("Não é possível gravar no arquivo", "Seu exploit não suporta a função writefile. Suas configurações não serão salvas.")
+        return
+    end
+    data[key] = value
+    writefile(DATA_FILENAME, HttpService:JSONEncode(data))
+end
+local function getDataFileValue(key: string): dataValueType?
+    return data[key]
+end
+
+local LATEST_VERSION_URL = "https://raw.githubusercontent.com/Damian-11/quizbot/master/version_number.luau"
+local success, LATEST_VERSION: string = pcall(function()
+    return loadstring(game:HttpGet(LATEST_VERSION_URL))()
+end)
+
+local outdated = if success and LATEST_VERSION then VERSION ~= LATEST_VERSION else false
+if outdated then
+    if not getDataFileValue("disableVersionAlert") then
+        notify(
+            "Versão do quizbot desatualizada",
+            "Você está executando uma versão desatualizada do quizbot. Clique no botão abaixo para copiar a versão mais recente deste script",
+            {
+                Callback = copyLatestScript,
+                Button1 = "Copiar versão mais recente",
+            },
+            10
+        )
+    end
+end
+
+local function EscapePattern(pattern: string)
+    local escapePattern = "[%(%)%.%%%+%-%*%?%[%]%^%$]"
+    return string.gsub(pattern, escapePattern, "%%%1")
+end
+
+local antiFilteringDone: boolean
+local importantMessageSent: boolean
+local messageBeforeFilter: string
+local answeredByAltMessage: string
+local mainQuestionSent: boolean
+local messageFiltered: boolean
+local lastMessageTime: number
+function SendMessageWhenReady(message: string, important: boolean?, altMessage: string?)
+    if not quizRunning or settings.disableChat then
+        return
+    end
+    if not settings.repeatTagged then
+        important = false
+    end
+    if important then
+        importantMessageSent = true
+        messageBeforeFilter = message
+        answeredByAltMessage = altMessage
+        messageFiltered = false
+        antiFilteringDone = false
+    end
+    if tick() - timeSinceLastMessage >= minMessageCooldown then
+        Chat(message)
+        timeSinceLastMessage = tick()
+    else
+        task.wait(minMessageCooldown - (tick() - timeSinceLastMessage))
+        if not quizRunning then
+            return
+        end
+        Chat(message)
+        timeSinceLastMessage = tick()
+    end
+    if important then
+        lastMessageTime = tick()
+        while (not antiFilteringDone or mainQuestionSent) and quizRunning and settings.repeatTagged do
+            task.wait()
+            if tick() - lastMessageTime > 4.5 then
+                notify("Falha ao enviar mensagem do quiz", "Limite de taxa de mensagens excedido. Evite enviar mensagens no chat enquanto um quiz estiver em execução. Isso também pode ser causado por alta latência de rede.", nil, 10)
+                messageFiltered = true
+                break
+            end
+        end
+    end
+    importantMessageSent = false
+end
+
+local boothGame = (placeId == 8351248417)
+local signRemote
+local changeSignTextRemote
+local boothFunction
+if placeId == 8351248417 then
+    signRemote = replicatedStorage:WaitForChild("Remotes").SettingsRem
+    changeSignTextRemote = replicatedStorage.SharedModules.TextInputPrompt.TextInputEvent
+    boothFunction = replicatedStorage.Remotes.Booth.BoothFunc
+end
+
+local function UpdateSignText(text: string)
+    local sign = localPlayer.Character:FindFirstChild("Text Sign") or localPlayer.Backpack:FindFirstChild("Text Sign")
+    if not sign then
+        return
+    end
+    signRemote:FireServer("SignServer")
+    changeSignTextRemote:FireServer({text})
+end
+
+local currentText = ""
+local originalBoothText = ""
+local boothDecalId = 0
+local function CaptureBoothTextAndImage()
+    if not boothGame or not boothFunction then
+        return
+    end
+    local result = boothFunction:InvokeServer("GetMyBoothTextImage")
+    if result then
+        if result.Text and result.Text ~= currentText then
+            originalBoothText = result.Text
+        end
+        if result.IID then
+            boothDecalId = result.IID
+        end
+    end
+end
+
+local function UpdateBoothText(text: string)
+    task.spawn(boothFunction.InvokeServer, boothFunction, "ChangeTIM", text, boothDecalId)
+end
+
+local readTimeOwedTick = 0
+
+local lastUpdateTick = 0
+local MIN_BOOTHGAME_UPDATE_COOLDOWN = 1
+local function UpdateBoothgameTexts(text: string, imporant: boolean)
+    if boothGame and text then
+        if not imporant and settings.boothGameFullMode and readTimeOwedTick > tick() then
+            return
+        end
+        local timeSinceLastUpdate = tick() - lastUpdateTick
+        if timeSinceLastUpdate < MIN_BOOTHGAME_UPDATE_COOLDOWN then
+            if imporant then
+                task.wait(MIN_BOOTHGAME_UPDATE_COOLDOWN - timeSinceLastUpdate)
+            else
+                return
+            end
+        end
+
+        if settings.signStatus and signRemote and changeSignTextRemote then
+            UpdateSignText(text)
+        end
+        if settings.boothStatus and boothFunction then
+            if text == "" then
+                UpdateBoothText(originalBoothText)
+            else
+                UpdateBoothText(text)
+            end
+        end
+        currentText = text
+        lastUpdateTick = tick()
+    end
+end
+
+local function SuppressBoothGameNotifications(suppress: boolean)
+    if not boothGame or not settings.boothGameSuppressNotifs then
+        return
+    end
+    local pushNotifScreenGui = localPlayer.PlayerGui:FindFirstChild("PushNotif")
+    local pushNotifSound = replicatedStorage.SharedModules.PushHandler.Presets.MainPreset.Sound
+    if pushNotifScreenGui then
+        pushNotifScreenGui.Enabled = not suppress
+    end
+    if pushNotifSound then
+        pushNotifSound.Volume = if suppress then 0 else 0.4
+    end
+end
+
+local maxCharactersInMessage = 200
+if placeId == 5118029260 then
+    maxCharactersInMessage = 100
+end
+
+local endMessage = "🏁 Quiz encerrado"
+
+local function CalculateReadTime(text: string): number
+    local timeToWait = #string.split(text, " ") * 0.4
+    if timeToWait < minMessageCooldown then
+        timeToWait = minMessageCooldown
+    end
+    return timeToWait
+end
+
+--- Question OOP ---
+local question = {}
+question.__index = question
+
+function question.New(quesitonText: string, options: { string }, value: number)
+    local newQuestion = {}
+    newQuestion.mainQuestion = quesitonText
+    newQuestion.answers = options
+    newQuestion.rightAnswer = letters[1]
+    newQuestion.rightAnswerIndex = 1
+    value = value or 1
+    newQuestion.value = value
+    setmetatable(newQuestion, question)
+    return newQuestion
+end
+
+function question:Ask(): boolean
+    if not quizRunning then
+        return false
+    end
+    answerOptionsSaid = 0
+    local rightAnswerBeforeShuffle = self.answers[self.rightAnswerIndex]
+    self.answers = shuffle(self.answers)
+    self.rightAnswerIndex = table.find(self.answers, rightAnswerBeforeShuffle)
+    self.rightAnswer = letters[self.rightAnswerIndex]
+    if self.value > 1 then
+        if settings.boothGameFullMode then
+            UpdateBoothgameTexts("⭐ "..self.value.."x pontos", true)
+        end
+        SendMessageWhenReady("⭐ | "..self.value.."x pontos pela pergunta")
+        task.wait(2)
+    end
+    questionAnsweredBy = nil
+    UpdateBoothgameTexts(self.mainQuestion, true)
+    currentQuestion = self
+    questionPoints = self.value
+    mainQuestionSent = true
+    SendMessageWhenReady("🎙️ | "..self.mainQuestion, true)
+    if messageFiltered then
+        task.wait(3)
+        Chat("➡️ | Filtragem repetida detectada. Pulando para a próxima pergunta...")
+        return false
+    end
+    local waitTime = CalculateReadTime(self.mainQuestion)
+    local timeWaited = 0
+    while waitTime > timeWaited do
+        if questionAnsweredBy or not quizRunning then
+            return true
+        end
+        task.wait(0.1)
+        timeWaited += 0.1
+    end
+    for i, v in ipairs(self.answers) do
+        if questionAnsweredBy or not quizRunning then
+            return true
+        end
+        if i ~= 1 then
+            task.wait(CalculateReadTime(self.answers[i - 1]))
+        end
+        if questionAnsweredBy or not quizRunning then
+            return true
+        end
+        local answerOptionText = letters[i]..")"..v
+        if settings.boothGameFullMode then
+            UpdateBoothgameTexts(answerOptionText, true)
+        end
+        SendMessageWhenReady(answerOptionText, true)
+        answerOptionsSaid = i
+        readTimeOwedTick = tick() + CalculateReadTime(self.answers[i])
+    end
+end
+
+local function splitIntoMessages(itemTable: { string }, separtor: string, clearFilter: boolean?, waitTime: number?)
+    local tempItemList = {}
+    local messages = {}
+    local currentLength = 0
+    for _, item in itemTable do
+        if currentLength + #item + (#separtor * #tempItemList) + 6 >= maxCharactersInMessage then
+            local conctatTable = table.concat(tempItemList, separtor)
+            table.insert(messages, conctatTable)
+            table.clear(tempItemList)
+            table.insert(tempItemList, item)
+            currentLength = #item
+        else
+            table.insert(tempItemList, item)
+            currentLength = currentLength + #item
+        end
+    end
+    table.insert(messages, table.concat(tempItemList, separtor))
+    for messageIndex, message in messages do
+        if quizRunning then
+            return
+        end
+        local messageNumberString = string.format("(%d/%d)", messageIndex, #messages)
+        if messageIndex == 2 or messageIndex == 3 then
+            if clearFilter then
+                Chat("Aguardando o filtro...", true)
+            end
+            task.wait(5)
+        end
+        if quizRunning then
+            return
+        end
+        Chat(message.." "..messageNumberString, true)
+        task.wait(waitTime or CalculateReadTime(message) * 0.7)
+    end
+end
+
+local antiAfkEnabled = false
+local function EnableAntiAfk()
+    if antiAfkEnabled then
+        return
+    end
+    local GC = getconnections or get_signal_cons
+	if GC then
+		for i, v in pairs(GC(localPlayer.Idled)) do
+			if v["Disable"] then
+				v["Disable"](v)
+			elseif v["Disconnect"] then
+				v["Disconnect"](v)
+			end
+		end
+	else
+		local VirtualUser = cloneref(game:GetService("VirtualUser"))
+		localPlayer.Idled:Connect(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end
+    antiAfkEnabled = true
+    notify("Anti-AFK ativado com sucesso", "Você não será expulso por ficar inativo")
+end
+
+--- Category OOP ---
+local categoryManager = {}
+local categories = {}
+categories.categoryList = {}
+categories.numberOfDifficulties = {}
+categoryManager.__index = categoryManager
+
+local difficultyOrder = {"", "easy", "medium", "hard"}
+function categoryManager.New(categoryName: string, difficulty: string?)
+    difficulty = difficulty or ""
+    difficulty = string.lower(difficulty)
+    if not categories.categoryList[categoryName] then
+		categories.categoryList[categoryName] = {}
+        categories.numberOfDifficulties[categoryName] = 0
+	end
+    if not categories.categoryList[categoryName][difficulty] then
+		categories.categoryList[categoryName][difficulty] = {}
+        categories.numberOfDifficulties[categoryName] += 1
+        if not table.find(difficultyOrder, difficulty) then
+            table.insert(difficultyOrder, difficulty)
+        end
+	end
+    table.insert(categories.categoryList[categoryName][difficulty], {})
+    local newCategory = categories.categoryList[categoryName][difficulty][#categories.categoryList[categoryName][difficulty]]
+    setmetatable(newCategory, categoryManager)
+    return newCategory
+end
+
+function categoryManager:Add(quesitonText: string, options: { string }, value: number?, customQuestion: table?)
+    self = customQuestion or self
+    local newQuestion = question.New(quesitonText, options, value)
+    table.insert(self, newQuestion)
+end
+
+local function getDisplayNameByUsername(username)
+    local displayName = players:FindFirstChild(username) and players:FindFirstChild(username).DisplayName
+    return displayName
+end
+
+--- Points OOP ---
+local pointManager = {}
+local userPoints = {}
+local UpdateUILeaderboard, ClearLeaderboardLabels
+
+function pointManager.NewAccount(player)
+    userPoints[player.Name] = {}
+    local playerPoints = userPoints[player.Name]
+    playerPoints.DisplayName = getDisplayNameByUsername(player.Name)
+    playerPoints.GlobalPoints = 0
+    playerPoints.CurrentQuizPoints = 0
+    return playerPoints
+end
+
+function pointManager.AddPoints(player, points: number, type: string)
+    if not points or not tonumber(points) then
+        points = 1
+    end
+    if not type then
+        type = "All"
+    end
+    local playerAccount = userPoints[player.Name]
+    if not playerAccount then
+        playerAccount = pointManager.NewAccount(player)
+    end
+    if type == "All" then
+        playerAccount.GlobalPoints += points
+        if quizRunning then
+            playerAccount.CurrentQuizPoints += points
+        end
+    elseif playerAccount[type] then
+        playerAccount[type] += points
+    end
+    UpdateUILeaderboard(type)
+end
+
+function pointManager.ClearQuizPoints()
+    for _, v in pairs(userPoints) do
+        v.CurrentQuizPoints = 0
+    end
+    ClearLeaderboardLabels("CurrentQuizPoints")
+end
+
+function pointManager.RemoveAccount(player)
+    if userPoints[player.Name] then
+        userPoints[player.Name] = nil
+        UpdateUILeaderboard("All")
+    end
+end
+
+function pointManager.ResetAllPoints()
+    for _, v in pairs(userPoints) do
+        v.GlobalPoints = 0
+        v.CurrentQuizPoints = 0
+    end
+    ClearLeaderboardLabels("CurrentQuizPoints")
+    ClearLeaderboardLabels("GlobalPoints")
+end
+
+local function SendMessageIfPossible(message)
+    timeSinceLastMessage = tick() - timeSinceLastMessage
+    if timeSinceLastMessage > 2.5 then
+        Chat(message)
+        timeSinceLastMessage = tick()
+    end
+end
+
+local function startChatListening(message: string, player: Player)
+    local messageContent = string.upper(message) or ""
+    if not currentQuestion or questionAnsweredBy or table.find(userCooldowns, player.Name) or table.find(blockedPlayers, player.Name) or table.find(submittedAnswer, player.Name) or (whiteListEnabled and not table.find(whiteListedplayers, player.Name)) then
+        return
+    end
+    local matchAnswer
+    local minLenght = 4
+    if #currentQuestion.answers[currentQuestion.rightAnswerIndex] < minLenght then
+        minLenght = #currentQuestion.answers[currentQuestion.rightAnswerIndex]
+    end
+    local escapedMessage = EscapePattern(messageContent)
+    if #messageContent >= minLenght then
+        for _, v in ipairs(currentQuestion.answers) do
+        local escapedAnswer = EscapePattern(v)
+            if v:upper() == messageContent then
+                matchAnswer = v
+                break
+            elseif (string.match(v:upper(), escapedMessage) and #string.match(v:upper(), escapedMessage) >= minLenght) or string.match(messageContent, escapedAnswer:upper()) then
+                if matchAnswer then
+                    return
+                end
+                matchAnswer = v
+            end
+        end
+    end
+    local matchingLetter = nil
+    if not matchAnswer then
+        local senderCharacter = player.Character
+        local character = localPlayer.Character
+        if not senderCharacter or not character then
+            return
+        end
+
+        local patterns = {}
+        patterns[1] = "%s([A-"..letters[#currentQuestion.answers].."])%s"
+        patterns[2] = "%s([B-"..letters[#currentQuestion.answers].."])$"
+        patterns[3] = "^([A-"..letters[#currentQuestion.answers].."])%s"
+        patterns[4] = "^([A-"..letters[#currentQuestion.answers].."])$"
+
+        messageContent = string.gsub(messageContent, "[%).?!]", "")
+        local magnitude = (character:GetPivot().Position - senderCharacter:GetPivot().Position).Magnitude
+        if magnitude < 10 then
+            for i = 1, 4 do
+                local match = messageContent:match(patterns[i])
+                if match and table.find(letters, match) <= answerOptionsSaid then
+                    if matchingLetter then
+                        return
+                    end
+                    matchingLetter = match
+                end
+            end
+        else
+            matchingLetter = messageContent:match(patterns[4])
+            if matchingLetter then
+                if table.find(letters, matchingLetter) > answerOptionsSaid then
+                    matchingLetter = nil
+                end
+            end
+        end
+    end
+    if matchingLetter or matchAnswer then
+        if matchingLetter == currentQuestion.rightAnswer or matchAnswer == currentQuestion.answers[currentQuestion.rightAnswerIndex] then
+            if mode == "Quiz" then
+                questionAnsweredBy = player
+                currentQuestion = nil
+            else
+                table.insert(submittedAnswer, player.Name)
+                table.insert(answeredCorrectly, player.DisplayName)
+                if #answeredCorrectly == 1 then
+                    pointManager.AddPoints(player, questionPoints * 1.5)
+                else
+                    pointManager.AddPoints(player, questionPoints)
+                end
+            end
+        elseif mode == "Quiz" then
+            if awaitingAnswer then
+                SendMessageIfPossible("❌ | "..player.DisplayName.." resposta errada. Tente novamente em "..tostring(settings.userCooldown).." segundos.")
+            end
+            table.insert(userCooldowns, player.Name)
+            task.delay(settings.userCooldown, function()
+                table.remove(userCooldowns, table.find(userCooldowns, player.Name))
+            end)
+        elseif mode == "Kahoot" then
+            table.insert(submittedAnswer, player.Name)
+        end
+    end
+end
+
+local filtersInARow = 0
+local function processMessage(player: Player, message: string)
+    if player ~= localPlayer then
+        startChatListening(message, player)
+    else
+        if not (importantMessageSent or mainQuestionSent) or not quizRunning or not messageBeforeFilter or not settings.repeatTagged then
+            return
+        end
+        message = string.gsub(message, "&amp;", "&")
+        if messageBeforeFilter == message or (answeredByAltMessage and string.find(message, answeredByAltMessage)) then
+            filtersInARow = 0
+            messageFiltered = false
+            mainQuestionSent = false
+            antiFilteringDone = true
+            return
+        elseif math.abs(#message - #messageBeforeFilter) > 8 or not string.find(message, "#") then
+            return
+        elseif mainQuestionSent and messageFiltered then
+            mainQuestionSent = false
+            antiFilteringDone = true
+            return
+        end
+        lastMessageTime = tick() + 5
+        messageFiltered = true
+        filtersInARow += 1
+        if filtersInARow == 1 then
+            SendMessageWhenReady("🔁 | Aguardando o filtro limpar e reenviando mensagem filtrada...")
+            task.wait(5)
+        elseif filtersInARow == 2 then
+            SendMessageWhenReady("🔁 | Reenviando mensagem anterior por causa do filtro de chat...")
+            task.wait(6)
+        else
+            SendMessageWhenReady("Tentando contornar a marcação do Roblox. Por favor, aguarde...")
+            task.wait(6)
+            filtersInARow = 0
+        end
+        if not quizRunning then
+            return
+        end
+        if questionAnsweredBy and answeredByAltMessage then
+            SendMessageWhenReady(answeredByAltMessage)
+            antiFilteringDone = true
+            return
+        elseif questionAnsweredBy then
+            antiFilteringDone = true
+            return
+        end
+        SendMessageWhenReady(messageBeforeFilter)
+        antiFilteringDone = true
+    end
+end
+
+local chatConnection = textChatService.MessageReceived:Connect(function(textChatMessage)
+    local player = if textChatMessage.TextSource then players:GetPlayerByUserId(textChatMessage.TextSource.UserId) else nil
+    if not player then
+        return
+    end
+    local message = textChatMessage.Text
+    processMessage(player, message)
+end)
+
+local function awaitAnswer(targetQuestion)
+    if not quizRunning then
+        return
+    end
+    awaitingAnswer = true
+    local timeIsOut = false
+    local function Timeout()
+        if not quizRunning then
+            return
+        end
+        task.wait(settings.questionTimeout)
+        UpdateBoothgameTexts("⏰ "..targetQuestion.rightAnswer..")"..targetQuestion.answers[targetQuestion.rightAnswerIndex], true)
+        timeIsOut = true
+        currentQuestion = nil
+        questionAnsweredBy = nil
+        awaitingAnswer = false
+        SendMessageWhenReady("⏰ | O tempo acabou! A resposta correta era: "..targetQuestion.rightAnswer..")"..targetQuestion.answers[targetQuestion.rightAnswerIndex], true)
+    end
+    local function SignTime()
+        timeLeft = settings.questionTimeout
+        while timeLeft > 0 do
+            if questionAnsweredBy then
+                return
+            end
+            local roundedTimeLeft = math.round(math.abs(timeLeft))
+            if roundedTimeLeft % 2 == 0 then
+                if settings.romanNumbers then
+                    task.defer(UpdateBoothgameTexts, tostring(intToRoman(roundedTimeLeft)))
+                else
+                    task.defer(UpdateBoothgameTexts, tostring(roundedTimeLeft))
+                end
+            end
+            timeLeft -= task.wait(1)
+        end
+    end
+    local timeoutCoroutine = coroutine.create(Timeout)
+    local signTimeCoroutine = coroutine.create(SignTime)
+    coroutine.resume(timeoutCoroutine)
+    if boothGame then
+        coroutine.resume(signTimeCoroutine)
+    end
+
+    if mode == "Quiz" then
+        while questionAnsweredBy == nil and (table.find({"normal", "running", "suspended"}, coroutine.status(timeoutCoroutine))) and quizRunning do
+            task.wait()
+        end
+        if timeIsOut or not quizRunning then
+            return
+        end
+        coroutine.close(timeoutCoroutine)
+        coroutine.close(signTimeCoroutine)
+        pointManager.AddPoints(questionAnsweredBy, targetQuestion.value)
+        task.delay(0.5, function()
+            UpdateBoothgameTexts("✔️ "..targetQuestion.rightAnswer..")"..targetQuestion.answers[targetQuestion.rightAnswerIndex], true)
+        end)
+        SendMessageWhenReady("✔️ | "..questionAnsweredBy.DisplayName.." respondeu corretamente. A resposta era: "..targetQuestion.rightAnswer..")"..targetQuestion.answers[targetQuestion.rightAnswerIndex], true, "[Nome do jogador filtrado] respondeu corretamente. A resposta era: "..targetQuestion.rightAnswer..")"..targetQuestion.answers[targetQuestion.rightAnswerIndex])
+        questionAnsweredBy = nil
+        awaitingAnswer = false
+        table.clear(userCooldowns)
+    else
+        while table.find({"normal", "running", "suspended"}, coroutine.status(timeoutCoroutine)) and quizRunning do
+            task.wait(1)
+            questionPoints -= questionPoints / settings.questionTimeout
+        end
+        task.wait(2)
+        if not quizRunning then
+            return
+        end
+        if #answeredCorrectly > 0 then
+            local tempuserList = {}
+            local currentLength = 37
+            local firstIteration = true
+            for _, user in pairs(answeredCorrectly) do
+                if currentLength + #user + (2 * #tempuserList) >= maxCharactersInMessage then
+                    if firstIteration then
+                        SendMessageWhenReady("✔️ | Jogadores que responderam corretamente: "..table.concat(tempuserList, ", "))
+                        UpdateBoothgameTexts("✔️ "..targetQuestion.rightAnswer..")"..targetQuestion.answers[targetQuestion.rightAnswerIndex], true)
+                        firstIteration = false
+                    else
+                        SendMessageWhenReady(table.concat(tempuserList, ", "))
+                    end
+                    task.wait(3)
+                    table.clear(tempuserList)
+                    table.insert(tempuserList, user)
+                    currentLength = #user
+                else
+                    table.insert(tempuserList, user)
+                    currentLength = currentLength + #user
+                end
+            end
+            if #tempuserList > 0 then
+                if firstIteration then
+                    SendMessageWhenReady("✔️ | Jogadores que responderam corretamente: "..table.concat(tempuserList, ", "))
+                    firstIteration = false
+                else
+                    SendMessageWhenReady(table.concat(tempuserList, ", "))
+                end
+            end
+        end
+        table.clear(answeredCorrectly)
+        table.clear(submittedAnswer)
+        awaitingAnswer = false
+        currentQuestion = nil
+    end
+end
+
+--- Questions ---
+do
+
+local countriesEasy = categoryManager.New("Guess the country", "easy")
+countriesEasy:Add("Que país é este? 🇹🇷", {"Turquia", "Espanha", "Grécia", "Chipre"})
+countriesEasy:Add("Que país é este? 🇪🇸", {"Espanha", "Portugal", "Grécia", "México"})
+countriesEasy:Add("Que país é este? 🇵🇱", {"Polônia", "Indonésia", "Áustria", "Groenlândia"})
+countriesEasy:Add("Que país é este? 🇮🇳", {"Índia", "Paquistão", "Sri Lanka", "Afeganistão"})
+countriesEasy:Add("Que país é este? 🇳🇴", {"Noruega", "Suécia", "Dinamarca", "Islândia"}, 2)
+
+local countriesEasy2 = categoryManager.New("Guess the country", "easy")
+countriesEasy2:Add("Que país é este? 🇫🇷", {"França", "Inglaterra", "Holanda", "Rússia"})
+countriesEasy2:Add("Que país é este? 🇬🇷", {"Grécia", "Sérvia", "Argentina", "Espanha"})
+countriesEasy2:Add("Que país é este? 🇦🇷", {"Argentina", "Honduras", "Estônia", "Brasil"})
+countriesEasy2:Add("Que país é este? 🇻🇳", {"Vietnã", "China", "Japão", "Pequim"})
+countriesEasy2:Add("Que país é este? 🇷🇸", {"Sérvia", "Bósnia", "Croácia", "Eslováquia"}, 2)
+
+local countriesMedium = categoryManager.New("Guess the country", "medium")
+countriesMedium:Add("Que país é este? 🇲🇽", {"México", "Holanda", "Irã", "Espanha"})
+countriesMedium:Add("Que país é este? 🇵🇹", {"Portugal", "Brasil", "Madri", "Espanha"})
+countriesMedium:Add("Que país é este? 🇲🇦", {"Marrocos", "Vietnã", "China", "Israel"}, 2)
+countriesMedium:Add("Que país é este? 🇧🇪", {"Bélgica", "Alemanha", "França", "Romênia"})
+countriesMedium:Add("Que país é este? 🇮🇩", {"Indonésia", "Polônia", "Peru", "Suíça"})
+
+local countriesHard = categoryManager.New("Guess the country", "hard")
+countriesHard:Add("Que país é este? 🇸🇮", {"Eslovênia", "Eslováquia", "Rússia", "Sérvia"})
+countriesHard:Add("Que país é este? 🇪🇷", {"Eritreia", "Equador", "El Salvador"})
+countriesHard:Add("Que país é este? 🇫🇮", {"Finlândia", "Suécia", "Ilhas Malvinas"})
+countriesHard:Add("Que país é este? 🇿🇲", {"Zâmbia", "Zimbábue", "Zaire"}, 2)
+countriesHard:Add("Que país é este? 🇸🇴", {"Somália", "Ilhas Salomão", "Samoa"})
+
+local science = categoryManager.New("Science", "medium")
+science:Add("A unidade padrão de medida usada para medir força é qual das seguintes?", {"Newton", "Milha", "Watt", "Quilograma"})
+science:Add("Quanto tempo a Terra leva para dar uma volta completa ao redor do sol?", {"365 dias", "7 dias", "30 dias"})
+science:Add("Óleo, gás natural e carvão são exemplos de …", {"Combustíveis fósseis", "Recursos renováveis", "Biocombustíveis", "Recursos geotérmicos"}, 2)
+science:Add("Por que nossas pupilas se contraem na luz forte?", {"Para deixar entrar menos luz", "Para dar mais oxigênio aos olhos", "Para mudar nossa visão para 3D"})
+science:Add("Como são chamadas as rochas de lava resfriada?", {"Rochas ígneas", "Magma", "Fósseis"})
+
+local science2 = categoryManager.New("Science", "medium")
+science2:Add("O que é mais rápido, o som ou a luz?", {"Luz", "Som", "Eles viajam na mesma velocidade", "Eles não se movem"})
+science2:Add("Qual destas NÃO é uma das leis do movimento de Newton?", {"Objetos em repouso permanecem em movimento", "Força é igual a massa vezes aceleração", "Toda ação tem uma reação igual e oposta", "Um objeto em movimento permanece em movimento"})
+science2:Add("Quem desenvolveu a teoria da relatividade?", {"Einstein", "Newton", "Galileu", "Darwin"})
+science2:Add("Qual destes NÃO é um estado da matéria?", {"Energia", "Sólido", "Líquido", "Gasoso"})
+science2:Add("Qual é a usina de força da célula?", {"Mitocôndria", "Núcleo", "Citoplasma", "Membrana nuclear"}, 2)
+
+local history = categoryManager.New("History", "medium")
+history:Add("Qual destes países a União Soviética NUNCA invadiu?", {"Suécia", "Afeganistão", "Finlândia", "Polônia"})
+history:Add("Qual foi a principal causa da Revolução Francesa em 1789?", {"A desigualdade social e econômica do Terceiro Estado", "A invasão de Napoleão Bonaparte", "Disputas sobre fronteiras territoriais com países vizinhos", "A propagação da Peste Negra"})
+history:Add("Qual civilização antiga construiu o complexo de Machu Picchu?", {"Inca", "Asteca", "Maia", "Egípcia"})
+history:Add("Como as pessoas chamam a era antes dos registros escritos?", {"Pré-história", "Idade Média", "Renascimento", "Era Industrial"})
+history:Add("Qual destes eventos históricos aconteceu primeiro?", {"A Revolução Americana", "A Revolução Francesa", "A Revolução Industrial", "A Revolução Russa"}, 2)
+
+local history2 = categoryManager.New("History", "medium")
+history2:Add("A doença que matou um terço da população da Europa no século XIV é conhecida como:", {"Peste (Peste Negra)", "Gripe Espanhola", "Varíola", "Malária"})
+history2:Add("Quem descobriu a América em 1492?", {"Cristóvão Colombo", "Marco Polo", "Fernão de Magalhães", "Leif Erikson"})
+history2:Add("Qual país presenteou os Estados Unidos com a Estátua da Liberdade?", {"França", "Alemanha", "Reino Unido", "Espanha"})
+history2:Add("Qual foi o nome do período de renovado interesse pela arte e pelo conhecimento?", {"Renascimento", "Reforma", "Iluminismo", "Revolução Industrial"}, 2)
+history2:Add("Qual famosa rota comercial conectava a Europa e a Ásia?", {"Rota da Seda", "Rota das Especiarias", "Rota do Âmbar", "Rota Transaariana"})
+
+local foodAndDrink = categoryManager.New("Food and Drink", "medium")
+foodAndDrink:Add("Qual país é o maior produtor de café do mundo?", {"Brasil", "Vietnã", "Colômbia", "Etiópia"})
+foodAndDrink:Add("Qual é o nome da sobremesa italiana feita com camadas de pão de ló embebido em café e queijo mascarpone?", {"Tiramisu", "Maritozzo", "Cannoli", "Zabaglione"})
+foodAndDrink:Add("Qual é o prato nacional da Inglaterra?", {"Fish and Chips", "Shepherd's Pie", "Yorkshire Pudding", "Sunday Roast"})
+foodAndDrink:Add("Qual é o nome da bebida fermentada de leite popular na Ásia Central e Europa Oriental?", {"Kefir", "Karin", "Kulmel", "Iogurte"})
+foodAndDrink:Add("De qual país vem o queijo feta?", {"Grécia", "Suíça", "Espanha", "França"}, 2)
+
+local trivia = categoryManager.New("Trivia", "medium")
+trivia:Add("Qual NÃO é uma categoria do Prêmio Nobel?", {"Matemática", "Física", "Literatura", "Química"})
+trivia:Add("Qual instrumento musical tem 47 cordas e sete pedais?", {"Harpa", "Piano", "Violão", "Violino"})
+trivia:Add("Qual é a capital do Japão?", {"Tóquio", "Pequim", "Seul", "Bangkok"})
+trivia:Add("Qual país é o único a ter uma bandeira não retangular?", {"Nepal", "Suíça", "Japão", "Catar"})
+trivia:Add("'Bokmål' e 'Nynorsk' são as duas formas escritas oficiais de qual idioma?", {"Norueguês", "Italiano", "Dinamarquês", "Espanhol"}, 2)
+
+local trivia2 = categoryManager.New("Trivia", "medium")
+trivia2:Add("Qual animal é o emblema nacional da Austrália?", {"Canguru", "Coala", "Emu", "Ornitorrinco"})
+trivia2:Add("O que a escala Richter mede?", {"Intensidade de terremotos", "Velocidade do vento", "Temperatura", "Força de tornados"}, 2)
+trivia2:Add("Qual moeda é usada no Japão?", {"Iene", "Dólar", "Euro", "Libra"})
+trivia2:Add("Qual é a substância natural mais dura da Terra?", {"Diamante", "Ouro", "Ferro", "Platina"})
+trivia2:Add("No esporte, a que se refere o termo PGA?", {"Associação Profissional de Golfistas", "Média de Golfe Par", "Média de Jogo de Golfe", "Amadores de Golfe em Tempo Parcial"})
+
+local guessTheLanguage = categoryManager.New("Guess the language", "medium")
+guessTheLanguage:Add("Je suis désolé", {"Francês", "Espanhol", "Italiano", "Português"})
+guessTheLanguage:Add("בוקר טוב", {"Hebraico", "Tâmil", "Laosiano", "Mandarim"})
+guessTheLanguage:Add("Guten Tag", {"Alemão", "Tagalo", "Finlandês", "Holandês"})
+guessTheLanguage:Add("こんにちは", {"Japonês", "Chinês", "Turco", "Árabe"}, 2)
+guessTheLanguage:Add("नमस्ते", {"Hindi", "Indonésio", "Cantonês", "Náuatle"})
+
+local capitals = categoryManager.New("Capital Cities", "easy")
+capitals:Add("Qual é a capital dos EUA?", {"Washington D.C.", "Nova York", "Los Angeles", "Austin"})
+capitals:Add("Qual é a capital da Finlândia?", {"Helsinque", "Estocolmo", "Dublin", "Reykjavik"}, 2)
+capitals:Add("Qual é a capital da Polônia?", {"Varsóvia", "Kiev", "Moscou", "Cracóvia"})
+capitals:Add("Qual é a capital da Alemanha?", {"Berlim", "Frankfurt", "Hamburgo", "Dusseldorf"})
+capitals:Add("Qual é a capital do Canadá?", {"Ottawa", "Toronto", "Vancouver", "Montreal"})
+
+local capitalsHard = categoryManager.New("Capital Cities", "hard")
+capitalsHard:Add("Qual é a capital da Bélgica?", {"Bruxelas", "Liège", "Amsterdã"})
+capitalsHard:Add("Qual é a capital da Somália?", {"Mogadíscio", "Garoowe", "Berbera"})
+capitalsHard:Add("Qual é a capital da Mongólia?", {"Ulan Bator", "Hanói", "Seul"})
+capitalsHard:Add("Qual é a capital da Austrália?", {"Camberra", "Sydney", "Perth"})
+capitalsHard:Add("Qual é a capital da Nova Zelândia?", {"Wellington", "Auckland", "Hamilton"})
+
+local geography = categoryManager.New("Geography", "easy")
+geography:Add("Em qual continente está localizado o Deserto do Saara?", {"África", "Ásia", "Europa", "América do Sul"})
+geography:Add("Qual rio passa por Londres?", {"Rio Tâmisa", "Rio Severn", "Rio Trent", "O Nilo"})
+geography:Add("Qual destas cidades NÃO é uma capital nacional?", {"Sydney", "Oslo", "Wellington", "Bangkok"}, 2)
+geography:Add("Qual continente tem a maior área terrestre?", {"Ásia", "África", "Europa", "América do Sul"})
+geography:Add("Qual é o menor país do mundo?", {"Cidade do Vaticano", "Bélgica", "Luxemburgo", "Hungria"})
+
+local geographyMedium = categoryManager.New("Geography", "medium")
+geographyMedium:Add("Qual ilha é a maior do mundo?", {"Groenlândia", "Madagascar", "Bornéu", "Nova Guiné"})
+geographyMedium:Add("Qual continente tem mais países?", {"África", "Europa", "Ásia", "Austrália"})
+geographyMedium:Add("Qual dos seguintes países fica mais ao norte?", {"Escócia", "Holanda", "Bélgica", "Polônia"})
+geographyMedium:Add("Qual é o rio mais longo do mundo?", {"O Nilo", "Rio Amazonas", "Rio Yangtzé", "Rio Amarelo"})
+geographyMedium:Add("Qual oceano é o mais profundo?", {"Oceano Pacífico", "Oceano Atlântico", "Oceano Índico", "Oceano Ártico"}, 2)
+
+local geographyHard = categoryManager.New("Geography", "hard")
+geographyHard:Add("Qual país tem o litoral mais longo?", {"Canadá", "Chile", "Noruega", "Austrália"})
+geographyHard:Add("Qual continente é o único sem deserto?", {"Europa", "Ásia", "América do Norte", "África"})
+geographyHard:Add("Qual dos seguintes países NÃO é um enclave?", {"Itália", "Cidade do Vaticano", "San Marino", "Lesoto"}, 2)
+geographyHard:Add("Qual é a capital mais ao norte do mundo?", {"Reykjavik, Islândia", "Oslo, Noruega", "Helsinque, Finlândia", "Moscou, Rússia"})
+geographyHard:Add("Qual cidade é a única localizada em dois continentes?", {"Istambul", "Cairo", "Moscou", "Cidade do Panamá"})
+
+local gaming = categoryManager.New("Gaming", "medium")
+gaming:Add("Qual é o videogame mais vendido de todos os tempos?", {"Minecraft", "FIFA 18", "Call of Duty: Modern Warfare 3", "Tetris"})
+gaming:Add("Qual foi o primeiro videogame comercialmente bem-sucedido?", {"Pong", "Donkey Kong Country", "Super Mario Bros", "Spacewar"})
+gaming:Add("Qual é o nome do personagem principal da série The Legend of Zelda?", {"Link", "Zelda", "Ganon", "Mario"})
+gaming:Add("Em qual videogame o Mario, personagem da Nintendo, apareceu pela primeira vez?", {"Donkey Kong", "Super Mario Bros", "Marios Cement Factory", "Mario Bros"}, 2)
+gaming:Add("Qual é o nome do mais recente dispositivo de realidade virtual desenvolvido pela Valve?", {"Steam Frame", "Oculus Rift", "Meta Quest", "Valve VR"})
+
+local gaming2 = categoryManager.New("Gaming", "medium")
+gaming2:Add("Qual empresa criou a franquia Mario?", {"Nintendo", "Sony", "Microsoft", "Sega"})
+gaming2:Add("Qual é o nome do desenvolvedor de jogos que criou Half-Life, Portal e Counter-Strike?", {"Valve", "Blizzard", "Bethesda", "Rockstar"})
+gaming:Add("Qual é o nome do console de jogos lançado pela Nintendo em 2006 e que apresentava controles de movimento?", {"Wii", "Switch", "GameCube", "DS"})
+gaming2:Add("Qual é o nome da série de jogos de plataforma que apresenta um encanador que resgata uma princesa de um vilão parecido com uma tartaruga?", {"Super Mario", "Sonic the Hedgehog", "Crash Bandicoot", "Cuphead"})
+gaming2:Add("Quantos títulos independentes de Grand Theft Auto foram lançados?", {"7", "5", "8", "10"}, 2)
+
+local movies = categoryManager.New("Movies", "medium")
+movies:Add("Qual ator interpretou o papel de Jack Sparrow na franquia 'Piratas do Caribe'?", {"Johnny Depp", "Orlando Bloom", "Keira Knightley", "Geoffrey Rush"})
+movies:Add("Qual foi o primeiro filme do Universo Cinematográfico Marvel?", {"Homem de Ferro", "Os Vingadores", "Batman", "Homem-Aranha"}, 2)
+movies:Add("Qual filme é baseado no romance de J.R.R. Tolkien?", {"O Senhor dos Anéis", "As Crônicas de Nárnia", "Jogos Vorazes", "O Código Da Vinci"})
+movies:Add("Qual é o nome do protagonista de Matrix?", {"Neo", "Morpheus", "Trinity", "Cypher"})
+movies:Add("No filme 'Frozen', quem é Olaf?", {"Um boneco de neve", "Um fantasma", "Um cavaleiro", "Uma rena"})
+
+local roblox = categoryManager.New("Roblox", "easy")
+roblox:Add("Qual era o nome original do Roblox?", {"DynaBlocks", "SuperBlocks", "XtraBlocks"})
+roblox:Add("Qual é o nome da outra moeda virtual do Roblox que foi removida desde 2016?", {"Tix", "Builder Coins", "Ro-Points"})
+roblox:Add("Qual programa você usa para criar jogos no Roblox?", {"Roblox Studio", "Roblox Player", "Roblox Create", "Roblox Creator"})
+roblox:Add("Os servidores privados do Roblox eram anteriormente conhecidos como qual dos seguintes?", {"Servidores VIP", "Servidores pessoais", "Servidores exclusivos"})
+roblox:Add("Quem ganhou o campeonato da 1ª temporada do RB Battles?", {"KreekCraft", "Tofuu", "Seedeng", "BriannaPlayz"}, 2)
+
+local roblox2 = categoryManager.New("Roblox", "easy")
+roblox2:Add("Qual é outro nome para a loja de avatares?", {"Catálogo", "Criador de Avatar", "Editor de Avatar"})
+roblox2:Add("Qual linguagem de programação você precisa usar para criar jogos no Roblox?", {"Luau", "JavaScript", "Python", "PHP"}, 2)
+roblox2:Add("Qual é o nome da conferência anual de desenvolvedores do Roblox?", {"RDC", "Robloxcon", "Robloxx", "Blockfest"})
+roblox2:Add("Qual era o antigo nome do Roblox Premium?", {"Builders Club", "Roblox Plus", "Roblox Pro", "VIP Club"})
+roblox2:Add("Qual foi o primeiro jogo do Roblox a alcançar mais de 1 bilhão de visitas?", {"MeepCity", "Arsenal", "Build a Boat For Treasure", "Adopt Me"}, 2)
+
+local english = categoryManager.New("English", "easy")
+english:Add("Qual dos seguintes é um substantivo próprio?", {"London", "City", "River", "Mountain"})
+english:Add("Qual é a maneira correta de pontuar esta frase?", {"However, I don't agree with your opinion.", "However I, don't agree with your opinion.", "However I don't, agree with your opinion.", "However; I don't agree with your opinion."})
+english:Add("Qual palavra é um adjetivo?", {"Beautiful", "Run", "Quickly", "Table"})
+english:Add("Qual é a grafia correta?", {"Necessary", "Neccessary", "Nessessary", "Necessay"})
+english:Add("Qual é o sujeito na frase: 'The cat chased the mouse across the yard'?", {"The cat", "The mouse", "The yard", "Chased"}, 2)
+
+local animals = categoryManager.New("Animals", "easy")
+animals:Add("Qual é o maior animal terrestre?", {"Elefante", "Girafa", "Baleia", "Rinoceronte"})
+animals:Add("Qual é o nome de um filhote de canguru?", {"Joey", "Cub", "Pup", "Kit"})
+animals:Add("Capaz de ultrapassar 300 km/h, qual é a criatura mais rápida do reino animal?", {"Falcão-peregrino", "Guepardo", "Cavalo", "Leão"})
+animals:Add("Qual é o único mamífero que pode voar?", {"Morcego", "Pinguim", "Pterodáctilo", "Dragão"}, 2)
+animals:Add("Qual destes “peixes” é na verdade um peixe?", {"Peixe-espada", "Estrela-do-mar", "Lagostim", "Água-viva"})
+
+local sports = categoryManager.New("Sports", "easy")
+sports:Add("Em qual esporte você pode fazer um 'chute de bicicleta'?", {"Futebol", "Basquete", "Rugby", "Tênis"})
+sports:Add("Qual país é famoso por inventar a luta de sumô?", {"Japão", "China", "Índia", "Tailândia"})
+sports:Add("Qual animal é usado no esporte tradicional do polo?", {"Cavalo", "Camelo", "Elefante", "Iaque"})
+sports:Add("Qual esporte também é conhecido como tênis de mesa?", {"Ping Pong", "Badminton", "Squash", "Tênis"})
+sports:Add("Qual esporte usa os termos 'strike' e 'spare'?", {"Boliche", "Beisebol", "Críquete", "Golfe"}, 2)
+
+local minecraft = categoryManager.New("Minecraft", "easy")
+minecraft:Add("Qual é o nome da criatura verde que explode?", {"Creeper", "Zumbi", "Esqueleto", "Slime"})
+minecraft:Add("Qual ferramenta é melhor para cavar pedra e tijolos?", {"Picareta", "Pá", "Machado", "Broca"})
+minecraft:Add("Qual é o nome da dimensão onde você enfrenta o Dragão do Fim?", {"The End", "The Nether", "The Overworld", "The Void"}, 2)
+minecraft:Add("Qual recurso você precisa para negociar com aldeões?", {"Esmeralda", "Maçã", "Ouro", "Ferro"})
+minecraft:Add("Qual bloco você pode usar para fazer um portal para o Nether?", {"Obsidiana", "Netherrack", "Pedregulho", "Bedrock"})
+
+local chess = categoryManager.New("Chess", "medium")
+chess:Add("Qual é o nome da peça que só pode se mover na diagonal?", {"Bispo", "Cavalo", "Rainha"})
+chess:Add("Qual é o termo para uma situação em que o rei está sob ataque e não pode escapar?", {"Xeque-mate", "Empate", "En passant", "Roque"})
+chess:Add("Qual é o nome da estratégia de xadrez que envolve sacrificar uma peça para ganhar vantagem?", {"Gambito", "Garfo", "Cravada", "Espeto"})
+chess:Add("Qual é o nome do movimento especial em que um rei e uma torre trocam de lugar?", {"Roque", "Promoção", "Captura", "Garfo"})
+chess:Add("Qual peça está envolvida no 'en passant'?", {"Peão", "Rainha", "Bispo", "Cavalo"}, 2)
+
+local WWII = categoryManager.New("WWII", "hard")
+WWII:Add("Quais países formaram as Potências do Eixo na Segunda Guerra Mundial?", {"Alemanha, Itália e Japão", "França, Grã-Bretanha e Rússia", "China, Índia e Austrália", "Canadá, México e Brasil"})
+WWII:Add("Qual país foi atacado pelo Japão em 1941, provocando sua entrada na Segunda Guerra Mundial?", {"EUA", "China", "Índia", "Austrália"})
+WWII:Add("Quais dois países foram os primeiros a declarar guerra à Alemanha?", {"Grã-Bretanha e França", "Itália e Grécia", "Noruega e Dinamarca", "Polônia e Rússia"})
+WWII:Add("Qual foi o nome da operação que marcou a invasão aliada da Normandia em 1944?", {"Operação Overlord", "Operação Barbarossa", "Operação Tocha", "Operação Garden"}, 2)
+WWII:Add("Qual foi o nome da máquina de decifração desenvolvida pelos britânicos para decifrar as cifras alemãs?", {"Bombe", "Turing", "Lorenz", "Enigma"})
+
+local WWI = categoryManager.New("WWI", "hard")
+WWI:Add("Qual país fez a primeira declaração de guerra na Primeira Guerra Mundial?", {"Áustria-Hungria", "Sérvia", "Rússia", "Alemanha"})
+WWI:Add("Qual foi o nome do navio de passageiros britânico afundado por um submarino alemão em 1915?", {"Lusitania", "Titanic", "Britannia", "Olympic"})
+WWI:Add("Qual foi o apelido dado ao tipo de guerra que envolvia cavar trincheiras e lutar a partir delas?", {"Guerra de trincheiras", "Guerra de guerrilha", "Guerra de terra", "Guerra de cerco"})
+WWI:Add("O que fez a Grã-Bretanha entrar na Primeira Guerra Mundial?", {"Tropas alemãs marchando pela Bélgica", "Ataques aéreos alemães a Londres", "Uso alemão de produtos químicos ilegais", "Alemães afundando navios civis britânicos"})
+WWI:Add("Qual foi o nome da aliança entre Alemanha, Áustria-Hungria e Itália?", {"Tríplice Aliança", "As Potências do Eixo", "A Tríplice Entente", "A Liga das Nações"}, 2)
+
+local luau = categoryManager.New("Luau", "hard")
+luau:Add("Qual é a palavra-chave para definir uma função em Luau?", {"function", "def", "local", "sub"})
+luau:Add("Qual é a sintaxe para criar um comentário em Luau?", {"-- comment", "// comment", "# comment", "' comment"}, 2)
+luau:Add("Qual é o tipo de dado para armazenar múltiplos valores em Luau?", {"table", "array", "list", "set"})
+luau:Add("Como você declara uma tabela em Luau?", {"local table = {}", "local table = []", "local table = table.new()", "local table = ()"})
+luau:Add("Qual é o símbolo para concatenar strings em Luau?", {"..", "+", "&", "%"}, 2)
+
+local astronomy = categoryManager.New("Astronomy", "medium")
+astronomy:Add("Qual é o nome do planeta anão que já foi considerado o nono planeta do nosso sistema solar?", {"Plutão", "Ceres", "Éris", "Haumea"})
+astronomy:Add("Qual é o nome da teoria que descreve como o universo começou com uma expansão massiva a partir de um único ponto?", {"A teoria do Big Bang", "A teoria do Estado Estacionário", "A teoria Inflacionária", "A teoria das Cordas"})
+astronomy:Add("Qual é o nome do maior planeta do nosso sistema solar?", {"Júpiter", "Saturno", "Terra", "Netuno"})
+astronomy:Add("Qual é o termo para um grupo de estrelas que forma um padrão reconhecível?", {"Uma constelação", "Uma nebulosa", "Um aglomerado", "Uma galáxia"})
+astronomy:Add("Qual é o nome da maior lua do nosso sistema solar?", {"Ganímedes", "Titã", "Io", "Europa"}, 2)
+
+local memes = categoryManager.New("Memes", "easy")
+memes:Add("Qual meme apresenta um cachorro sentado em um quarto em chamas?", {"This is fine", "Doge", "Grumpy Cat", "Bad Luck Brian"})
+memes:Add("Qual é o nome do personagem sapo frequentemente associado à frase 'feels good man'?", {"Pepe", "Kermit", "Frogger", "Freddy"}, 2)
+memes:Add("Qual é o termo para um meme com aparência de baixa qualidade e pixelado?", {"Deep fried", "Dank", "Cringe", "Ironic"})
+memes:Add("Qual animal está associado ao meme 'Doge'?", {"Shiba Inu", "Grumpy Cat", "Keyboard Cat", "Nyan Cat"})
+memes:Add("Qual é o nome do meme que apresenta a cabeça de um homem saindo de um vaso sanitário branco?", {"Skibidi Toilet", "TF2 Guy", "Fanum Tax", "Smurf Cat"})
+
+local anime = categoryManager.New("Anime", "easy")
+anime:Add("Qual é o nome do personagem principal de Naruto?", {"Naruto Uzumaki", "Naruto Uchiha", "Kakashi Naruto", "Itachi Uchiha"})
+anime:Add("Qual é o nome da tripulação pirata que Monkey D. Luffy lidera em One Piece?", {"Piratas do Chapéu de Palha", "Piratas do Barba Negra", "Piratas do Cabelo Vermelho", "Piratas do Barba Branca"})
+anime:Add("Qual é o nome do poderoso caderno que pode matar qualquer pessoa cujo nome esteja escrito nele?", {"Death Note", "Kira Note", "Shinigami Note", "Life Note"})
+anime:Add("Em Death Note, como Light Yagami descobre o famoso caderno pela primeira vez?", {"Ele o vê cair do céu", "Ele o recebe como presente de um amigo", "Ele é entregue a ele em uma caixa misteriosa", "Ele o encontra no metrô"}, 2)
+anime:Add("Qual é o nome do personagem principal da série Pokémon?", {"Ash Ketchum", "Naruto Uzumaki", "Gary Oak", "Pikachu"})
+
+local scienceHard = categoryManager.New("Science", "hard")
+scienceHard:Add("Qual é o nome do maior osso do corpo humano?", {"Fêmur", "Úmero", "Tíbia", "Pelve"})
+scienceHard:Add("Qual destas partículas é sua própria antipartícula?", {"Fóton", "Próton", "Elétron", "Nêutron"})
+scienceHard:Add("Qual é o nome do fenômeno em que a luz é espalhada por partículas em um meio que não são muito maiores que o comprimento de onda da luz?", {"Espalhamento Rayleigh", "Difração", "Refração", "Dispersão"}, 2)
+scienceHard:Add("Qual é o nome do ramo da matemática que lida com as propriedades e relações de entidades abstratas como números, símbolos, conjuntos e funções?", {"Álgebra", "Geometria", "Cálculo", "Lógica"})
+scienceHard:Add("Qual é o nome da unidade de diferença de potencial elétrico, energia potencial elétrica por unidade de carga?", {"Volt", "Ampère", "Ohm", "Watt"})
+
+local mathCategory = categoryManager.New("Math", "easy")
+mathCategory:Add("Qual é o valor de PI (arredondado para duas casas decimais)?", {"3.14", "3.15", "3.16", "3.17"})
+mathCategory:Add("A propriedade que afirma que a + b = b + a tem qual nome?", {"Propriedade comutativa", "Propriedade associativa", "Propriedade distributiva", "Propriedade identidade"}, 2)
+mathCategory:Add("Qual é a fórmula para a área de um círculo?", {"pi * r^2", "2 * pi * r", "pi * d", "pi * r"})
+mathCategory:Add("Qual é o nome do ramo da matemática que estuda formas e ângulos?", {"Geometria", "Álgebra", "Cálculo", "Aritmética"})
+mathCategory:Add("Qual é o valor de x na equação 2x + 5 = 13?", {"4", "3", "5", "6"})
+
+local mathHard = categoryManager.New("Math", "hard")
+mathHard:Add("Qual é o nome do teorema que afirma que a² + b² = c² para um triângulo retângulo?", {"Teorema de Pitágoras", "Último teorema de Fermat", "Teorema binomial", "Teorema de Euclides"})
+mathHard:Add("Qual é a derivada de e^x?", {"e^x", "x*e^(x-1)", "ln(x)", "1/e^x"})
+mathHard:Add("Qual é o nome da constante que é aproximadamente igual a 2,71828?", {"Número de Euler", "A proporção áurea", "PI", "Constante de Planck"})
+mathHard:Add("Qual é o nome da sequência que começa com 1, 1, 2, 3, 5, 8, ...?", {"Sequência de Fibonacci", "Sequência Aritmética", "Sequência Geométrica", "Sequência Harmônica"}, 2)
+mathHard:Add("Qual é o nome do ramo da matemática que lida com padrões e sequências?", {"Combinatória", "Álgebra", "Cálculo", "Geometria"})
+
+local coldWar = categoryManager.New("Cold War", "hard")
+coldWar:Add("Em 1946, Winston Churchill popularizou qual termo usado para descrever as relações soviéticas com as potências ocidentais?", {"Cortina de ferro", "Destruição mútua assegurada", "Atoleiro", "Perigo para a sociedade"})
+coldWar:Add("Frequentemente citada como a contraparte da CIA, qual era o nome da agência de inteligência soviética?", {"KGB", "ICBM", "SALT", "DMZ"})
+coldWar:Add("Criado em 1959, o sistema DEFCON tem cinco estágios de prontidão militar. Qual classificação DEFCON é usada quando um ataque nuclear é iminente ou já está em andamento?", {"DEFCON 1", "DEFCON 3", "DEFCON 5"})
+coldWar:Add("Embora nunca tenha deixado completamente a organização, em 1966 qual país retirou seu exército da OTAN e expulsou a sede da OTAN de suas fronteiras?", {"França", "Estados Unidos", "Polônia", "Alemanha Ocidental"})
+coldWar:Add("Frequentemente visto como a versão soviética do atoleiro do Vietnã dos Estados Unidos, a invasão de 10 anos da U.R.S.S. de qual país começou em 1979?", {"Afeganistão", "Polônia", "Tchecoslováquia", "Ucrânia"}, 2)
+
+local chemistry = categoryManager.New("Chemistry", "hard")
+chemistry:Add("Qual é a fórmula química da água?", {"H2O", "CO2", "O2", "2HO"})
+chemistry:Add("Qual é o nome do processo que converte um sólido em gás sem passar por um estado líquido?", {"Sublimação", "Evaporação", "Condensação", "Deposição"})
+chemistry:Add("Qual é o nome do elemento com o símbolo K?", {"Potássio", "Cálcio", "Criptônio", "Kalium"})
+chemistry:Add("Qual é o nome do processo que separa uma mistura de líquidos com base em seus pontos de ebulição?", {"Destilação", "Filtração", "Cristalização", "Cromatografia"})
+chemistry:Add("Qual é o nome do composto orgânico que tem a fórmula geral CnH2n+2?", {"Alcano", "Alceno", "Alcino", "Amônia"}, 2)
+
+local biology = categoryManager.New("Biology", "medium")
+biology:Add("Qual é o nome do processo pelo qual as plantas produzem seu próprio alimento?", {"Fotossíntese", "Respiração", "Transpiração", "Fermentação"})
+biology:Add("Qual é a menor unidade da vida?", {"Célula", "Átomo", "Molécula", "Órgão"})
+biology:Add("Qual é a função principal das células vermelhas do sangue?", {"Transporte de oxigênio", "Combater infecções", "Coagulação sanguínea", "Produzir anticorpos"})
+biology:Add("Quais são os principais blocos de construção das proteínas?", {"Aminoácidos", "Ácidos graxos", "Ácidos nucleicos", "Glicose"}, 2)
+biology:Add("Qual é o nome da molécula que carrega informações genéticas na maioria dos organismos vivos?", {"DNA", "Célula", "ATP", "ADP"})
+
+local sayings = categoryManager.New("Sayings and Idioms", "easy")
+sayings:Add("Qual expressão significa revelar um segredo?", {"Let the cat out of the bag", "Paint the town red", "Beat around the bush", "Bite the bullet"})
+sayings:Add("A que se refere 'a piece of cake'?", {"Algo muito fácil", "Uma sobremesa", "Uma tarefa difícil", "Uma pequena porção"})
+sayings:Add("Qual expressão significa estar em apuros?", {"In hot water", "On cloud nine", "Under the weather", "Out of the blue"})
+sayings:Add("O que significa 'hold your horses'?", {"Seja paciente", "Ande a cavalo", "Trabalhe duro", "Vá mais rápido"})
+sayings:Add("O que significa 'break a leg'?", {"Boa sorte", "Realmente quebrar uma perna", "Fugir", "Fazer uma pausa"}, 2)
+
+local internetSlang = categoryManager.New("Internet Slang", "easy")
+internetSlang:Add("O que significa 'LOL'?", {"Rir Alto", "Muito Amor", "Vivendo em Terra Firme", "Olhe para a Esquerda"})
+internetSlang:Add("O que significa 'FOMO'?", {"Medo de Ficar de Fora", "Amigos do Meu Escritório", "Gosto de Seguir em Frente", "Cheio de Muitas Opções"})
+internetSlang:Add("O que significa 'IMO'?", {"Na Minha Opinião", "Pedido por Correio pela Internet", "É Segunda-feira, Obviamente", "Quero Dizer, Ok"})
+internetSlang:Add("Qual é o significado de 'SMH'?", {"Balançando a Cabeça", "Tanto Ódio", "Envie Mais Ajuda", "Batendo a Cabeça"})
+internetSlang:Add("O que significa 'IIRC'?", {"Se Eu Me Lembro Corretamente (Se Eu Lembro Bem)", "É Realmente Legal (É Realmente Legal)", "Sou Incrivelmente Rico, Criança", "Informação Interessante Requer Consideração"}, 2)
+
+local internetSlang2 = categoryManager.New("Internet Slang", "medium")
+internetSlang2:Add("O que significa 'FTFY'?", {"Corrigi Isso Para Você", "Para o Ano Seguinte", "Esqueça Isso, Encontre-se", "Mais Rápido Que Cinquenta Iques"})
+internetSlang2:Add("Qual é o significado de 'AMA'?", {"Pergunte-me Qualquer Coisa", "Sempre Fazendo Suposições", "Outro Compromisso Perdido", "Alerta de Meme Incrível"})
+internetSlang2:Add("O que significa 'YOLO'?", {"Você Só Vive Uma Vez", "Suas Próprias Obrigações de Vida", "Cebolas Velhas de Ontem", "Gritando Alto Frequentemente"})
+internetSlang2:Add("O que significa 'OMW'?", {"A Caminho", "Oh Minha Palavra", "Apenas Homens Bem-vindos", "Site Oficial de Memes"})
+internetSlang2:Add("Qual é o significado de 'ITT'?", {"Neste Tópico", "Eu Vou Dizer a Eles", "Eu Acho Que", "Eu Conversei Com"}, 2)
+
+local guessTheMovie = categoryManager.New("Guess the Movie", "easy")
+guessTheMovie:Add("Qual filme apresenta um jovem bruxo frequentando a Escola de Hogwarts?", {"Harry Potter e a Pedra Filosofal", "O Senhor dos Anéis", "As Crônicas de Nárnia", "O Mágico de Oz"})
+guessTheMovie:Add("Qual filme conta a história de um peixe-palhaço procurando seu filho pelo oceano?", {"Procurando Nemo", "O Espanta Tubarões", "A Pequena Sereia", "Free Billy"})
+guessTheMovie:Add("Qual filme de ficção científica apresenta alienígenas de pele azul chamados Na'vi?", {"Avatar", "Star Wars", "Alien", "Distrito 9"})
+guessTheMovie:Add("Em qual filme Tom Hanks interpreta um homem preso em uma ilha com apenas uma bola de vôlei como companhia?", {"Náufrago", "O Terminal", "Forrest Gump", "O Resgate do Soldado Ryan"}, 2)
+guessTheMovie:Add("Qual filme conta a história de um grupo de brinquedos que ganham vida quando os humanos não estão por perto?", {"Toy Story", "Uma Aventura LEGO", "Pequenos Guerreiros", "Detona Ralph"})
+
+local guessTheBook = categoryManager.New("Guess the Book", "medium")
+guessTheBook:Add("Em qual livro uma jovem chamada Alice cai em uma toca de coelho para um mundo fantástico?", {"Alice no País das Maravilhas", "O Mágico de Oz", "Peter Pan", "O Jardim Secreto"})
+guessTheBook:Add("Qual livro conta a história de um personagem chamado Bilbo Bolseiro?", {"O Hobbit", "O Senhor dos Anéis", "O Silmarillion", "Eragon"})
+guessTheBook:Add("Qual livro apresenta uma sociedade distópica onde os livros são queimados?", {"Fahrenheit 451", "Admirável Mundo Novo", "O Senhor das Moscas", "Matadouro-Cinco"}, 2)
+guessTheBook:Add("Qual livro conta a história de um menino chamado Charlie que ganha um bilhete dourado?", {"A Fantástica Fábrica de Chocolate", "James e o Pêssego Gigante", "A Fábrica de Chocolate de Wonka", "O BGA"})
+guessTheBook:Add("Qual livro conta a história de um menino que nunca cresce e vive na Terra do Nunca?", {"Peter Pan", "O Mágico de Oz", "Alice no País das Maravilhas", "As Crônicas de Nárnia"})
+
+local music = categoryManager.New("Music", "medium")
+music:Add("Qual banda lançou o álbum 'The Dark Side of the Moon'?", {"Pink Floyd", "The Beatles", "Led Zeppelin", "The Rolling Stones"})
+music:Add("Como você chama as palavras de uma música?", {"Letra", "Melodia", "Harmonia", "Ritmo"})
+music:Add("Qual destes NÃO é um instrumento de sopro?", {"Violino", "Flauta", "Clarinete", "Saxofone"})
+music:Add("Como é chamado o hino nacional dos Estados Unidos?", {"The Star Spangled Banner", "God Save the Queen", "La Marseillaise", "O Canada"})
+music:Add("Qual destes NÃO é um tipo de violão?", {"Violoncelo", "Acústico", "Elétrico", "Baixo"}, 2)
+
+local brainrot = categoryManager.New("Brainrot", "easy")
+brainrot:Add("Qual é a palavra para aqueles homenzinhos estranhos presos em banheiros?", {"Skibidi", "Cobras de vaso sanitário", "Gnomos de encanamento", "Garotos de vaso"})
+brainrot:Add("Como se chama quando alguém fala longamente de maneira irritante?", {"Yapping", "Woofing", "Ranting", "Monologuing"})
+brainrot:Add("Qual termo descreve alguém que é um pouco lobo solitário — talvez até melhor que um alfa?", {"Sigma", "Ômega", "Beta", "Zeta"})
+brainrot:Add("Em qual estado dos EUA é mais provável que coisas estranhas, selvagens e infelizes aconteçam, de acordo com a internet?", {"Only in Ohio", "Only in Alaska", "Only in Florida", "Only in Mississippi"})
+brainrot:Add("Qual é o nome da bebida roxa do McDonald's?", {"Grimace Shake", "Sussy Punch", "Blueberry McFlurry", "Shake Vencido"}, 2)
+
+local brainrot2 = categoryManager.New("Brainrot", "easy")
+brainrot2:Add("O que significa estar 'cooked'?", {"Em uma situação muito ruim", "Extremamente faminto", "Sentindo muito cansado", "Animado ou empolgado"})
+brainrot2:Add("Complete a lacuna: 'Erm, what the ___'?", {"sigma", "dog", "heck", "alpha"})
+brainrot2:Add("Qual é o termo para elogiar ou cumprimentar alguém excessivamente?", {"Glazing", "Rizzing", "Gassing", "Fawning"})
+brainrot2:Add("Quem é o principal inimigo do Skibidi Toilet?", {"Cameraman", "Janitor", "Skibidi Sink", "G-Man"}, 2)
+brainrot2:Add("Complete a citação: 'Just put the ___ in the bag.'", {"Fries", "Money", "Skibidi", "Rizz"})
+
+local gamerWords = categoryManager.New("Gamer Words", "easy")
+gamerWords:Add("O que significa 'GG'?", {"Bom Jogo", "Fique Bom", "Ótimo Gol", "Garota Gamer"})
+gamerWords:Add("Qual frase diz aos jogadores para fazer uma pausa no mundo real e sair?", {"Touch Grass", "Eat a Salad", "Get Off", "Chillax"})
+gamerWords:Add("Um 'Noob' é um:", {"Jogador Novo", "Bot de Operações Noturnas", "Trapaceiro", "Espectador da Nintendo"})
+gamerWords:Add("'OP' significa:", {"Overpowered (Superpoderoso)", "Original Poster (Autor Original)", "Online Player (Jogador Online)", "Open Party (Festa Aberta)"})
+gamerWords:Add("Se alguém está 'Buffing', eles estão:", {"Se Fortalecendo", "Malhando", "Limpando Equipamento", "Recebendo Dano"}, 2)
+
+local gamerWords2 = categoryManager.New("Gamer Words", "easy")
+gamerWords2:Add("Quando os desenvolvedores enfraquecem uma arma forte, eles a ___ :", {"Nerfam", "Buffam", "Corrigem", "Ajustam"})
+gamerWords2:Add("'Camping' em shooters significa:", {"Ficar em Um Só Lugar", "Trapacear", "Modo Cooperativo", "Construir Acampamentos"})
+gamerWords2:Add("Um 'Clutch' é uma:", {"Vitória de Última Hora", "Peça de Carro", "Carregada de Equipe", "Falha de Controle"})
+gamerWords2:Add("Se um jogador está tentando zerar um jogo o mais rápido possível, ele está tentando um ...", {"Speedrun", "Desafio de Velocidade", "Prova de Tempo", "Ataque de Tempo"})
+gamerWords2:Add("Como se chama o ato de puxar inimigos para lutar contra eles individualmente?", {"Kiting", "Buffing", "Turtling", "Zerging"}, 2)
+
+local streaming = categoryManager.New("Streaming Culture", "medium")
+streaming:Add("'IRL' significa:", {"Na Vida Real", "Lista de Regras da Internet", "Nível de Recompensa de Item", "Loot de Raid Instantâneo"})
+streaming:Add("O emote 'PogChamp' expressa:", {"Empolgação", "Decepção", "Raiva", "Tristeza"})
+streaming:Add("Um espectador que assiste silenciosamente sem conversar é chamado de:", {"Lurker", "NPC", "Nonchatter", "Sneaker"})
+streaming:Add("Você pode Torcer para streamers usando qual moeda?", {"Bits", "Moedas", "Créditos", "Super Chats"})
+streaming:Add("Qual é o termo para quando um streamer envia seus espectadores para outra transmissão ao vivo?", {"Raid", "Swap", "Relay", "Transfer"}, 2)
+
+local computerHardware = categoryManager.New("Computer Hardware", "medium")
+computerHardware:Add("Qual componente é considerado o 'cérebro' de um computador?", {"CPU", "RAM", "GPU", "HDD"})
+computerHardware:Add("O que significa GPU?", {"Unidade de Processamento Gráfico", "Unidade de Processamento Geral", "Unidade de Desempenho de Jogos", "Unidade de Processamento Global"})
+computerHardware:Add("Em qual unidade a memória do computador (RAM) é tipicamente medida?", {"Gigabytes", "Volts", "Hertz", "Watts"})
+computerHardware:Add("Qual é a porta padrão para conectar um monitor?", {"HDMI", "USB", "Ethernet", "PS/2"})
+computerHardware:Add("Qual tipo de memória perde todos os seus dados quando o computador é desligado?", {"RAM", "HDD", "SSD", "ROM"}, 2)
+
+local ancientCivilizations = categoryManager.New("Ancient Civilizations", "medium")
+ancientCivilizations:Add("Qual civilização antiga tinha lutas de gladiadores?", {"Romanos", "Gregos", "Egípcios", "Chineses"})
+ancientCivilizations:Add("Qual civilização antiga construiu as pirâmides de Gizé?", {"Egito", "Inca", "Roma", "Grécia"})
+ancientCivilizations:Add("Qual era a capital do Império Romano?", {"Roma", "Atenas", "Alexandria", "Constantinopla"})
+ancientCivilizations:Add("Qual civilização inventou a democracia?", {"Grécia Antiga", "Roma", "Egito", "Pérsia"}, 2)
+ancientCivilizations:Add("Qual civilização antiga inventou o papel?", {"Chineses", "Egípcios", "Gregos", "Persas"})
+
+local worldRecords = categoryManager.New("World Records", "easy")
+worldRecords:Add("Qual é o animal terrestre mais rápido?", {"Guepardo", "Leão", "Cavalo", "Antílope"})
+worldRecords:Add("Qual livro detém o recorde de ser o mais vendido e traduzido da história?", {"A Bíblia", "O Senhor dos Anéis", "Harry Potter e a Pedra Filosofal", "O Alcorão"})
+worldRecords:Add("Qual é o maior país por área terrestre?", {"Rússia", "China", "Estados Unidos", "Canadá"})
+worldRecords:Add("Qual é a montanha mais alta do mundo?", {"Monte Everest", "K2", "Monte Kilimanjaro", "Monte Fuji"})
+worldRecords:Add("Qual é a palavra mais longa em um dicionário importante?", {"Pneumonoultramicroscopicsilicovolcanoconiosis", "Supercalifragilisticexpialidocious", "Hippopotomonstrosesquippedaliophobia", "Floccinaucinihilipilification"}, 2)
+
+end
+
+local function addTrailingZeros(number: number, desiredLength: number): string
+    local numberString = tostring(number)
+    local lenghtDifference = desiredLength - string.len(numberString)
+    return string.rep("0", math.max(0, lenghtDifference))..numberString
+end
+
+local categoryTable = {}
+local categoryLookupTable = {}
+
+local function UpdateCategoryTable(categoryName: string, difficulties: table)
+    local multipleDifficulties = categories.numberOfDifficulties[categoryName] > 1
+    for difficulty, quizzes in difficulties do
+        for index, quiz in quizzes do
+            local listName
+            if #quizzes > 1 and multipleDifficulties then
+                local finalIndex = addTrailingZeros(index, string.len(#quizzes))
+                listName = categoryName.."-"..difficulty..finalIndex
+                table.insert(categoryTable, listName)
+            elseif multipleDifficulties and difficulty ~= "" then
+                listName = categoryName.."-"..difficulty
+                table.insert(categoryTable, listName)
+            elseif #quizzes > 1 or (difficulty == "" and multipleDifficulties) then
+                local finalIndex = addTrailingZeros(index, string.len(#quizzes))
+                listName = categoryName.."-"..finalIndex
+                table.insert(categoryTable, listName)
+            else
+                listName = categoryName
+                table.insert(categoryTable, listName)
+            end
+            categoryLookupTable[listName] = {quiz, difficulty}
+        end
+    end
+end
+
+for categoryName, difficulties in categories.categoryList do
+    UpdateCategoryTable(categoryName, difficulties)
+end
+table.sort(categoryTable, sortAlphabetically)
+
+local function SortDifficulty(a, b)
+	local aOrder = table.find(difficultyOrder, a:match("^(%a+)%d*$"))
+	local bOrder = table.find(difficultyOrder, b:match("^(%a+)%d*$"))
+    if not aOrder or not bOrder then
+        return a < b
+    elseif aOrder == bOrder then
+		return a < b
+	else
+		return aOrder < bOrder
+	end
+end
+
+local categoriesToSend: { string } = {}
+local categoriesToSendDetailed: { string } = {}
+
+local function addToSendCategoryTable(categoryName: string, difficulties: { any })
+    local formattedCategory = {}
+    local iterator = 0
+    local multipleDifficulties = categories.numberOfDifficulties[categoryName] > 1
+    for difficulty, quizzes in difficulties do
+        iterator += 1
+        if #quizzes > 1 and multipleDifficulties then
+            for index, quiz in quizzes do
+                table.insert(formattedCategory, difficulty..index)
+            end
+        elseif multipleDifficulties and difficulty == "" then
+            table.insert(formattedCategory, difficulty.."1")
+        elseif multipleDifficulties then
+            table.insert(formattedCategory, difficulty)
+        elseif #quizzes > 1 then
+            table.insert(formattedCategory, tostring(#quizzes))
+        end
+    end
+    table.sort(formattedCategory, SortDifficulty)
+    if #formattedCategory > 0 then
+        formattedCategory = categoryName.." ["..table.concat(formattedCategory, ", ").."]"
+    else
+        formattedCategory = categoryName
+    end
+    table.insert(categoriesToSendDetailed, formattedCategory)
+    table.insert(categoriesToSend, categoryName)
+end
+
+for categoryName, difficulties in categories.categoryList do
+    addToSendCategoryTable(categoryName, difficulties)
+end
+table.sort(categoriesToSend, sortAlphabetically)
+table.sort(categoriesToSendDetailed, sortAlphabetically)
+
+local firstTimeSendingCategories = true
+local currentlySending: string?
+local function sendCategories()
+    if not quizRunning and not currentlySending then
+        currentlySending = "A lista de categorias está"
+        local waitTime = 5
+        if firstTimeSendingCategories and settings.sendDetailedCategorylist then
+            notify("Aviso: possível filtragem", "Desative as categorias detalhadas nas configurações se a lista de categorias for filtrada")
+            waitTime = 7
+        end
+        Chat("❓ | Tópicos do quiz:", true)
+        task.wait(3)
+        if settings.sendDetailedCategorylist then
+            splitIntoMessages(categoriesToSendDetailed, ", ", true, waitTime)
+        else
+            splitIntoMessages(categoriesToSend, ", ", false, waitTime)
+        end
+        if settings.sendDetailedCategorylist then
+            firstTimeSendingCategories = false
+        end
+        currentlySending = nil
+    elseif currentlySending then
+        notify(`{currentlySending} sendo enviada no momento`, "Aguarde terminar o envio antes de enviar a lista de categorias")
+    elseif quizRunning then
+        notify("Não é possível enviar a lista de categorias", "Não é possível enviar a lista de categorias enquanto um quiz está em execução. Pare o quiz ou aguarde ele terminar")
+    end
+end
+
+local  function IsCategoryEqual(categoryName: string, matchCategory: string, suffix: string): boolean
+    if categoryName == matchCategory then
+        return true
+    end
+    local pattern = "^"..EscapePattern(categoryName..suffix)
+    return string.match(matchCategory, pattern) ~= nil
+end
+
+local function RemoveDuplicateCategories(targetTable: table, categoryName: string, suffix: string)
+    local tempTable = table.clone(targetTable)
+    for i = 1, #targetTable do
+        if IsCategoryEqual(categoryName, targetTable[i], suffix) then
+            table.remove(tempTable, table.find(tempTable, targetTable[i]))
+        end
+    end
+    return tempTable
+end
+
+local categoryDropdown
+local function UpdateCategory(categoryName: string)
+    categoriesToSend = RemoveDuplicateCategories(categoriesToSend, categoryName, "")
+    categoriesToSendDetailed = RemoveDuplicateCategories(categoriesToSendDetailed, categoryName, " [")
+    local difficulties = categories.categoryList[categoryName]
+    addToSendCategoryTable(categoryName, difficulties)
+    categoryTable = RemoveDuplicateCategories(categoryTable, categoryName, "-")
+    UpdateCategoryTable(categoryName, difficulties)
+end
+
+local numberOfCategoriesPerDifficulty: { number } = {}
+for categoryName, category in categoryLookupTable do
+    if not numberOfCategoriesPerDifficulty[category[2]] then
+        numberOfCategoriesPerDifficulty[category[2]] = 1
+    else
+        numberOfCategoriesPerDifficulty[category[2]] += 1
+    end
+end
+------------- Custom question OOP -------------
+local CustomCategoryManager = {}
+CustomCategoryManager.__index = CustomCategoryManager
+local categoryNames = {}
+
+local autoplayFilterDifficulties: { string } = {}
+local autoplayFilterDropdown
+function CustomCategoryManager.New(categoryName: string, difficulty: string?)
+    CustomCategoryManager.scheduleRefresh()
+    if type(categoryName) == "string" then
+        if type(difficulty) ~= "string" then
+            difficulty = ""
+        else
+            difficulty = string.lower(difficulty)
+        end
+        if not numberOfCategoriesPerDifficulty[difficulty] or numberOfCategoriesPerDifficulty[difficulty] == 0 then
+            numberOfCategoriesPerDifficulty[difficulty] = 1
+            if difficulty == "" then
+                 table.insert(autoplayFilterDifficulties, "dificuldade ausente")
+            else
+                table.insert(autoplayFilterDifficulties, difficulty)
+            end
+            autoplayFilterDropdown:Refresh(autoplayFilterDifficulties)
+        end
+        for name, _ in categories.categoryList do
+            if string.lower(name) == string.lower(categoryName) then
+                categoryName = name
+            end
+        end
+        local newCategory = setmetatable(categoryManager.New(categoryName, difficulty), CustomCategoryManager)
+        categoryNames[newCategory] = categoryName
+        UpdateCategory(categoryNames[newCategory])
+        return newCategory
+    else
+        print("Erro de quiz personalizado | CategoryName não é uma string")
+    end
+    notify("Não é possível adicionar quiz personalizado", "Veja a saída para mais informações")
+end
+
+function CustomCategoryManager:Add(quesitonText: string, options: { string }, value: number?)
+    if type(quesitonText) == "string" then
+        if type(options) == "table" then
+            if #options > 1 then
+                if type(value) == "nil" or type(value) == "number" then
+                    categoryManager:Add(quesitonText, options, value, self)
+                    return
+                else
+                    print("Erro de quiz personalizado | [" .. quesitonText .. "] o valor da pergunta precisa ser um número ou nil")
+                end
+            else
+                print("Erro de quiz personalizado | [" .. quesitonText .. "] a tabela de opções precisa ter mais de uma opção")
+            end
+        else
+            print("Erro de quiz personalizado | [" .. quesitonText .. "] opções não é uma tabela")
+        end
+    else
+        print("Erro de quiz personalizado | [" .. quesitonText .. "] quesitonText não é uma string")
+    end
+    notify("Não é possível adicionar pergunta personalizada", "Veja a saída para mais informações")
+end
+
+function CustomCategoryManager.scheduleRefresh()
+    if not CustomCategoryManager.refreshScheduled then
+        CustomCategoryManager.refreshScheduled = true
+        task.defer(function()
+            table.sort(categoriesToSend, sortAlphabetically)
+            table.sort(categoriesToSendDetailed, sortAlphabetically)
+            table.sort(categoryTable, sortAlphabetically)
+            categoryDropdown:Refresh(categoryTable)
+            CustomCategoryManager.refreshScheduled = false
+        end)
+    end
+end
+
+local function sortUserPoints(type)
+    local array = {}
+    for username, value in pairs(userPoints) do
+        array[#array+1] = {username, value[type], value.DisplayName}
+    end
+    table.sort(array, function(a, b)
+        return a[2] > b[2]
+    end)
+    return array
+end
+
+local medalEmojis = {"🥇 ", "🥈 ", "🥉 "}
+local function sendLeaderboard(type: string, message: string, triggeredByUser: boolean?)
+    if triggeredByUser and quizRunning then
+        notify("Não é possível enviar o placar", "Não é possível enviar o placar enquanto o quiz está em execução. Pare o quiz atual ou aguarde ele terminar")
+        return
+    elseif currentlySending then
+        notify(`{currentlySending} sendo enviada no momento`, "Aguarde terminar o envio antes de enviar o placar")
+        return
+    end
+    currentlySending = "Um placar está"
+    local pointsArray
+    message = message or ""
+    if type == "Current quiz" then
+        pointsArray = sortUserPoints("CurrentQuizPoints")
+    else
+        pointsArray = sortUserPoints("GlobalPoints")
+    end
+    task.wait(1.5)
+    if triggeredByUser and quizRunning then
+        return
+    end
+    for i = 1, 3 do
+        if pointsArray[i] and pointsArray[i][2] > 0 then
+            if i == 1 then
+                Chat(message..type.." leaderboard:")
+            end
+            local username = pointsArray[i][1]
+            local displayName = pointsArray[i][3]
+            local points = roundNumber(pointsArray[i][2], 1)
+            local pointWord = if points > 1 then "pontos" else "ponto"
+            task.wait(2.5)
+            if triggeredByUser and quizRunning then
+                return
+            end
+            Chat(medalEmojis[i]..displayName.." (@"..username..") - "..points.." "..pointWord)
+            UpdateBoothgameTexts(medalEmojis[i]..displayName, true)
+        end
+    end
+    task.wait(2.5)
+    currentlySending = nil
+end
+local leaderboardLabels = {
+    CurrentQuizPoints = {},
+    GlobalPoints = {}
+}
+local function GetPointsAndUpdateLabels(type: string)
+    local pointsArray = sortUserPoints(type)
+    for index, label in leaderboardLabels[type] do
+        if pointsArray[index] and pointsArray[index][2] > 0 then
+            local username = pointsArray[index][1]
+            local displayName = pointsArray[index][3]
+            local points = roundNumber(pointsArray[index][2], 1)
+            local pointWord = if points > 1 then "pontos" else "ponto"
+            label:Set(`{medalEmojis[index]} {displayName} (@{username}) - {points} {pointWord}`)
+        else
+            label:Set(medalEmojis[index].." [Vazio] - 0")
+        end
+    end
+end
+ClearLeaderboardLabels = function(type: string)
+    for index, label in leaderboardLabels[type] do
+        label:Set(medalEmojis[index].." [Vazio] - 0")
+    end
+end
+UpdateUILeaderboard = function(type: string?)
+    type = type or "All"
+    if type == "All" then
+        GetPointsAndUpdateLabels("GlobalPoints")
+        GetPointsAndUpdateLabels("CurrentQuizPoints")
+    else
+        assert(leaderboardLabels[type], "Tipo de placar inválido")
+        GetPointsAndUpdateLabels(type)
+    end
+end
+
+local autoplayChosenCategories = {}
+local autoPlayDifficulties = difficultyOrder
+local function choseAutoplayCategory()
+    local autoplayComplete = true
+    for _, difficulty in autoPlayDifficulties do
+        if autoplayChosenCategories[difficulty] and not (#autoplayChosenCategories[difficulty] == numberOfCategoriesPerDifficulty[difficulty]) then
+            autoplayComplete = false
+            break
+        elseif not autoplayChosenCategories[difficulty] and numberOfCategoriesPerDifficulty[difficulty] then
+            autoplayComplete = false
+            break
+        end
+    end
+    if autoplayComplete then
+        table.clear(autoplayChosenCategories)
+    end
+    local chosenCategory = categoryTable[math.random(#categoryTable)]
+    local chosenCategoryDifficulty = categoryLookupTable[chosenCategory][2]
+    if (autoplayChosenCategories[chosenCategoryDifficulty] and table.find(autoplayChosenCategories[chosenCategoryDifficulty], chosenCategory)) or not table.find(autoPlayDifficulties, categoryLookupTable[chosenCategory][2]) then
+        return choseAutoplayCategory()
+    else
+        return chosenCategory
+    end
+end
+
+local function isFreeToRunQuiz(): boolean
+    if quizRunning then
+        notify("Um quiz está em execução no momento", "Pare o quiz atual ou aguarde ele terminar")
+        return false
+    elseif quizCooldown then
+        notify("Tempo de espera ativo", "Tente novamente em alguns segundos")
+        return false
+    end
+    return true
+end
+
+local function startQuiz(category: string)
+    if not isFreeToRunQuiz() then
+        return
+    end
+    SuppressBoothGameNotifications(true)
+    CaptureBoothTextAndImage()
+    quizRunning = true
+    pointManager.ClearQuizPoints()
+    Chat('🚀 | Iniciando quiz "'..category..'"...')
+    UpdateBoothgameTexts(category)
+    task.wait(3)
+    local loopIterations = 0
+    for _, v in pairs(categoryLookupTable[category][1]) do
+        if not quizRunning then
+            return
+        end
+        local questionAsked = v:Ask()
+        if questionAsked == false then
+            currentQuestion = nil
+            questionAnsweredBy = nil
+            task.wait(5)
+            continue
+        end
+        awaitAnswer(v)
+        if not quizRunning then
+            return
+        end
+        task.wait(6)
+        loopIterations += 1
+        if not quizRunning then
+            return
+        end
+        if loopIterations == settings.sendLeaderBoardAfterQuestions and settings.automaticLeaderboards and settings.automaticCurrentQuizLeaderboard then
+            sendLeaderboard("Current quiz", "📜 | ")
+            loopIterations = 0
+        end
+    end
+    task.wait(2)
+    if loopIterations ~= 0 and settings.automaticLeaderboards and settings.automaticCurrentQuizLeaderboard then
+        sendLeaderboard("Current quiz", "📜 | ")
+    end
+    UpdateBoothgameTexts(endMessage, true)
+    if settings.automaticLeaderboards and settings.automaticServerQuizLeaderboard then
+        sendLeaderboard("Server", "🏆 | Quiz encerrado. ")
+        task.wait(2)
+    else
+        SendMessageWhenReady("🏁 | Quiz encerrado")
+        task.wait(3)
+    end
+    task.delay(8, function()
+        if not quizRunning then
+            UpdateBoothgameTexts("", true)
+            task.wait(6)
+            SuppressBoothGameNotifications(false)
+        end
+    end)
+    quizRunning = false
+    if settings.autoplay then
+        if not autoplayChosenCategories[categoryLookupTable[category][2]] then
+            autoplayChosenCategories[categoryLookupTable[category][2]] = {category}
+        else
+            table.insert(autoplayChosenCategories[categoryLookupTable[category][2]], category)
+        end
+        UpdateBoothgameTexts("🎲 Escolhendo próxima categoria...", true)
+        Chat("🎲 | Escolhendo próxima categoria...")
+        local chosenCategory = choseAutoplayCategory()
+        task.wait(6)
+        startQuiz(chosenCategory)
+    else
+        UpdateBoothgameTexts(endMessage, true)
+    end
+end
+
+local quizModeRules = {
+    "Cada pergunta tem uma resposta correta e uma ou mais respostas erradas. Você pode enviar suas respostas apenas pelo chat de texto, não por voz.",
+    "Se você enviar uma resposta incorreta, sempre terá que esperar "..tostring(settings.userCooldown).." segundos antes de poder enviar outra resposta.",
+    "Se você enviar uma resposta correta, ganhará pontos.",
+}
+local kahootModeRules = {
+    "Cada pergunta tem uma resposta correta e uma ou mais respostas erradas. Você pode enviar suas respostas apenas pelo chat de texto, não por voz.",
+    "Você pode enviar apenas UMA resposta por pergunta.", "A primeira resposta que você enviar é sua resposta final, e ela não pode ser alterada.",
+    "Você tem "..tostring(settings.questionTimeout).." segundos para responder à pergunta depois que todas as opções forem ditas.",
+    "A cada segundo depois que todas as opções forem ditas, os pontos que você ganhará por responder corretamente diminuem.",
+    "Em outras palavras, quanto mais rápido você responder, mais pontos ganhará.",
+    "Além disso, a primeira pessoa que enviar uma resposta correta ganha 1,5x pontos.",
+}
+local function sendRules()
+    if quizRunning then
+        notify("Não é possível enviar as regras", "Não é possível enviar as regras enquanto o quiz está em execução. Pare o quiz atual ou aguarde ele terminar")
+        return
+    elseif currentlySending then
+        notify(`{currentlySending} sendo enviada no momento`, "Aguarde terminar o envio antes de enviar as regras")
+        return
+    end
+    currentlySending = "As regras estão"
+    if mode == "Quiz" then
+        Chat("📜 | Regras do modo Quiz:", true)
+        task.wait(2)
+        splitIntoMessages(quizModeRules, " ", 2)
+    elseif mode == "Kahoot" then
+        Chat("📜 | Regras do modo Kahoot:", true)
+        task.wait(2)
+        splitIntoMessages(kahootModeRules, " ")
+    end
+    currentlySending = nil
+end
+
+players.PlayerRemoving:Connect(function(player)
+    if settings.removeLeavingPlayersFromLB then
+        pointManager.RemoveAccount(player)
+    end
+end)
+
+local function getPlayerByPlayerName(name)
+    if name then
+        name = string.lower(name)
+        for i, v in ipairs(players:GetPlayers()) do
+            if string.lower(string.sub(v.Name, 1, #name)) == name then
+                return v
+            end
+            if string.lower(string.sub(v.DisplayName, 1, #name)) == name then
+                return v
+            end
+        end
+        for i, v in ipairs(players:GetPlayers()) do
+            if string.match(v.Name:lower(), name) then
+                return v
+            end
+            if string.match(v.DisplayName:lower(), name) then
+                return v
+            end
+        end
+    end
+end
+
+local function getTargetPlayer(name)
+    local target
+    local matchingPlayer = getPlayerByPlayerName(name)
+    if name:lower() == "me" then
+        target = localPlayer
+        return target
+    elseif matchingPlayer then
+        target = matchingPlayer
+        return target
+    end
+    target = nil
+    return target
+end
+
+local function getCategoryName(name: string)
+    if #name < 2 then
+        return
+    end
+    name = name:lower()
+    for _, category in categoryTable do
+        if string.lower(string.sub(category, 1, #name)) == name then
+            return category
+        end
+    end
+end
+---------- UI ----------
+local library, window
+
+setgenv("DISABLE_RAYFIELD_REQUESTS", true)
+setgenv("rayfieldCached", true)
+local success, errorMessage = pcall(function()
+    library = loadstring(game:HttpGet('https://raw.githubusercontent.com/Damian-11/Rayfield/stable/source.lua'))()
+    window = library:CreateWindow({
+        Name = "quizbot | Feito por Damian11 AKA Quizzer",
+        LoadingTitle = "Carregando quizbot...",
+        LoadingSubtitle = "feito por Damian11 AKA Quizzer",
+        ShowText = "quizbot",
+        DisableRayfieldPrompts = true,
+        DisableBuildWarnings = true,
+    })
+end)
+if not success then
+    notify("Erro do quizbot", "Falha ao carregar a biblioteca de UI. Por favor, reporte este bug no servidor do Discord:", {
+        Callback = setclipboard("https://discord.gg/wm384KFFMC"),
+        Button1 = "Copiar link do convite"
+    })
+    warn("Erro do quizbot [UI LIB] | " .. errorMessage)
+    return
+end
+
+local function toggleUI(_actionName, inputState, _inputObject)
+    if inputState == Enum.UserInputState.Begin then
+        library:SetVisibility(not library:IsVisible())
+    end
+end
+
+if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled then
+    ContextActionService:BindAction("ToggleUI", toggleUI, true)
+    ContextActionService:SetImage("ToggleUI", "rbxassetid://100698995249426")
+end
+
+local mainTab = window:CreateTab("Main", 74002778429106)
+
+if outdated and not getDataFileValue("disableVersionAlert") then
+    mainTab:CreateSection("Aviso de versão desatualizada")
+    mainTab:CreateParagraph({
+        Title = "Versão do quizbot desatualizada",
+        Content = "Você está usando uma versão desatualizada do quizbot. Use a versão mais recente para acessar novos recursos, quizzes atualizados e mais. [Desative nas configurações]"
+    })
+    mainTab:CreateButton({
+        Name = "Clique neste botão para copiar a versão mais recente do quizbot",
+        Callback = copyLatestScript,
+    })
+end
+
+mainTab:CreateSection("Seleção de categoria")
+local categoryLabel
+local selectedCategory
+mainTab:CreateInput({
+    Name = "Categoria",
+    PlaceholderText = "Digite um nome de categoria",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(value)
+        selectedCategory = getCategoryName(value)
+        if selectedCategory then
+            categoryLabel:Set("Categoria selecionada: "..selectedCategory)
+            categoryDropdown:Set({selectedCategory})
+        end
+    end
+})
+categoryDropdown = mainTab:CreateDropdown({
+    Name = "Categoria",
+    Options = categoryTable,
+    CurrentOption = "Selecione uma categoria",
+    Callback = function(option)
+        selectedCategory = option[1]
+        categoryLabel:Set("Categoria selecionada: "..selectedCategory)
+    end
+})
+mainTab:CreateButton({
+    Name = "Enviar lista de categorias no chat",
+    Callback = sendCategories
+})
+
+mainTab:CreateSection("Controles do quiz")
+categoryLabel = mainTab:CreateLabel("Categoria selecionada: Nenhuma")
+mainTab:CreateButton({
+    Name = "Iniciar quiz",
+    Callback = function()
+        if categoryLookupTable[selectedCategory] then
+            startQuiz(selectedCategory)
+        else
+            notify("Categoria inválida", "Selecione uma categoria válida para iniciar o quiz")
+        end
+    end
+})
+mainTab:CreateButton({
+    Name = "Parar quiz",
+    Callback = function()
+        if quizRunning then
+            quizCooldown = true
+            quizRunning = false
+            currentQuestion = nil
+            questionAnsweredBy = nil
+            awaitingAnswer = false
+            task.delay(5, function()
+                quizCooldown = false
+            end)
+        end
+    end
+})
+
+mainTab:CreateSection("Reprodução automática")
+mainTab:CreateToggle({
+    Name = "Reproduzir quizzes automaticamente",
+    CurrentValue = settings.autoplay,
+    Callback = function(value)
+        settings.autoplay = value
+        EnableAntiAfk()
+    end
+})
+
+for _, difficulty: string in difficultyOrder do
+    if numberOfCategoriesPerDifficulty[difficulty] and numberOfCategoriesPerDifficulty[difficulty] > 0 then
+        if difficulty == "" then
+            difficulty = "dificuldade ausente"
+        end
+        table.insert(autoplayFilterDifficulties, difficulty)
+    end
+end
+autoplayFilterDropdown = mainTab:CreateDropdown({
+    Name = "Filtro de reprodução automática (desmarque tudo para desativar o filtro)",
+    Options = autoplayFilterDifficulties,
+    MultipleOptions = true,
+    Callback = function(options)
+        local filteredTable = table.clone(options)
+        if #options == 0 then
+            filteredTable = difficultyOrder
+        elseif table.find(filteredTable, "dificuldade ausente") then
+            filteredTable[table.find(filteredTable, "dificuldade ausente")] = ""
+        end
+        autoPlayDifficulties = filteredTable
+    end
+})
+mainTab:CreateButton({
+    Name = "Jogar quiz aleatório",
+    Callback = function()
+        if isFreeToRunQuiz() then
+            local chosenCategory = choseAutoplayCategory()
+            notify("Quiz aleatório escolhido", `Iniciando quiz de {chosenCategory}`)
+            startQuiz(chosenCategory)
+        end
+    end
+})
+
+local leaderboardTab = window:CreateTab("Leaderboard", 97885193604839)
+leaderboardTab:CreateSection("Placar do servidor (não reinicia)")
+for i = 1, 3 do
+    table.insert(leaderboardLabels.GlobalPoints, leaderboardTab:CreateLabel(medalEmojis[i].." [Vazio] - 0"))
+end
+leaderboardTab:CreateButton({
+    Name = "Enviar placar do servidor no chat",
+    Callback = function()
+        sendLeaderboard("Server", "🏆 | ", true)
+    end
+})
+
+leaderboardTab:CreateSection("Placar do quiz atual (reinicia a cada quiz)")
+for i = 1, 3 do
+    table.insert(leaderboardLabels.CurrentQuizPoints, leaderboardTab:CreateLabel(medalEmojis[i].." [Vazio] - 0"))
+end
+leaderboardTab:CreateButton({
+    Name = "Enviar placar do quiz atual no chat",
+    Callback = function()
+        sendLeaderboard("Current quiz", "📜 | ", true)
+    end
+})
+
+leaderboardTab:CreateSection("Reiniciar pontos")
+leaderboardTab:CreateButton({
+    Name = "Reiniciar todos os pontos",
+    Callback = pointManager.ResetAllPoints
+})
+
+local playerControlTab = window:CreateTab("Player controls", 100068360107422)
+local targetPlayer
+local targetPlayerLabel
+playerControlTab:CreateSection("Selecionar alvo")
+playerControlTab:CreateInput({
+    Name = "Alvo",
+    PlaceholderText = "Digite o nome do alvo",
+    Callback = function(value)
+        if #value < 1 then return end
+        targetPlayer = getTargetPlayer(value)
+        if targetPlayer then
+            targetPlayerLabel:Set(`Alvo: {targetPlayer.DisplayName} (@{targetPlayer.Name})`)
+        else
+            targetPlayerLabel:Set("Alvo: Nenhum")
+        end
+    end
+})
+
+local function TargetExists(target)
+    if not target then
+        notify("Alvo inválido", "Especifique um jogador alvo")
+        return false
+    else
+        return true
+    end
+end
+
+targetPlayerLabel = playerControlTab:CreateLabel("Alvo: Nenhum")
+playerControlTab:CreateSection("Modificar pontos")
+local pointsToAdd
+playerControlTab:CreateInput({
+    Name = "Quantidade de pontos",
+    PlaceholderText = "Digite a quantidade de pontos",
+    Callback = function(value)
+        if value and tonumber(value) then
+            pointsToAdd = value
+        end
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Aplicar pontos",
+    Callback = function()
+        if not TargetExists(targetPlayer) then
+            return
+        end
+        if pointsToAdd then
+            pointManager.AddPoints(targetPlayer, pointsToAdd, "GlobalPoints")
+            notify("Pontos adicionados", pointsToAdd.." pontos do servidor foram adicionados a "..targetPlayer.Name)
+        else
+            notify("Digite uma quantidade de pontos", "Digite uma quantidade de pontos para adicionar")
+        end
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Remover todos os pontos do jogador",
+    Callback = function()
+        if not TargetExists(targetPlayer) then return end
+        pointManager.RemoveAccount(targetPlayer)
+        notify("Pontos reiniciados", "Todos os pontos de "..targetPlayer.Name.." foram removidos com sucesso")
+    end
+})
+
+playerControlTab:CreateSection("Bloquear")
+playerControlTab:CreateButton({
+    Name = "Bloquear de participar",
+    Callback = function()
+        if not TargetExists(targetPlayer) then return end
+        if not table.find(blockedPlayers, targetPlayer.Name) then
+            table.insert(blockedPlayers, targetPlayer.Name)
+            notify("Jogador bloqueado", targetPlayer.Name.." foi bloqueado de participar")
+        else
+            notify("Não é possível bloquear o jogador", targetPlayer.Name.." já está bloqueado de participar")
+        end
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Desbloquear de participar",
+    Callback = function()
+        if not TargetExists(targetPlayer) then return end
+        if table.find(blockedPlayers, targetPlayer.Name) then
+            table.remove(blockedPlayers, table.find(blockedPlayers, targetPlayer.Name))
+            notify("Jogador desbloqueado", targetPlayer.Name.." não está mais bloqueado de participar")
+        else
+            notify("Não é possível desbloquear o jogador", targetPlayer.Name.." não está bloqueado de participar")
+        end
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Desbloquear todos",
+    Callback = function()
+        notify("Todos desbloqueados", #blockedPlayers.." jogadores foram desbloqueados")
+        table.clear(blockedPlayers)
+    end
+})
+
+playerControlTab:CreateSection("Lista de permissões")
+playerControlTab:CreateToggle({
+    Name = "Ativar lista de permissões",
+    CurrentValue = whiteListEnabled,
+    Callback = function(value)
+        whiteListEnabled = value
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Adicionar à lista de permissões",
+    Callback = function()
+        if not TargetExists(targetPlayer) then return end
+        if not table.find(whiteListedplayers, targetPlayer.Name) then
+            table.insert(whiteListedplayers, targetPlayer.Name)
+            if whiteListEnabled then
+                notify("Jogador na lista de permissões", targetPlayer.Name.." foi adicionado à lista de permissões. A lista está ativada no momento")
+            else
+                notify("Jogador na lista de permissões", targetPlayer.Name.." foi adicionado à lista de permissões, mas a lista está desativada no momento")
+            end
+        else
+            notify("Não é possível adicionar o jogador", targetPlayer.Name.." já está na lista de permissões")
+        end
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Remover da lista de permissões",
+    Callback = function()
+        if not TargetExists(targetPlayer) then return end
+        if table.find(whiteListedplayers, targetPlayer.Name) then
+            table.remove(whiteListedplayers, table.find(whiteListedplayers, targetPlayer.Name))
+            notify("Jogador removido", targetPlayer.Name.." não está mais na lista de permissões")
+        else
+            notify("Não é possível remover o jogador", targetPlayer.Name.." não está na lista de permissões")
+        end
+    end
+})
+playerControlTab:CreateButton({
+    Name = "Limpar lista de permissões",
+    Callback = function()
+        notify("Lista de permissões limpa", #whiteListedplayers.." jogadores foram removidos da lista de permissões")
+        table.clear(whiteListedplayers)
+    end
+})
+
+local settingsTab = window:CreateTab("Settings", 112502172419483)
+settingsTab:CreateSection("Servidor do Discord")
+settingsTab:CreateLabel("Entre no meu servidor do Discord: discord.gg/wm384KFFMC")
+settingsTab:CreateButton({
+    Name = "Clique neste botão para copiar o link do convite",
+    Callback = function()
+        setclipboard("https://discord.gg/wm384KFFMC")
+        notify("Convite copiado com sucesso", "O link do convite foi copiado para a sua área de transferência")
+    end
+})
+
+settingsTab:CreateSection("Selecionar modo")
+settingsTab:CreateDropdown({
+    Name = "Modo",
+    Options = {"Quiz", "Kahoot"},
+    CurrentOption = mode,
+    Callback = function(option)
+        mode = option[1]
+        if mode == "Quiz" then
+            Chat("❓ | Modo Quiz ativado", true)
+        elseif mode == "Kahoot" then
+            Chat("✉️ | Modo Kahoot ativado", true)
+        end
+    end
+})
+settingsTab:CreateButton({
+    Name = "Enviar regras no chat",
+    Callback = sendRules
+})
+
+settingsTab:CreateSection("Configurações de tempo")
+settingsTab:CreateInput({
+    Name = "Tempo limite da pergunta",
+    PlaceholderText = settings.questionTimeout,
+    Callback = function(value)
+        if value and tonumber(value) then
+            settings.questionTimeout = tonumber(value)
+        end
+    end
+})
+settingsTab:CreateInput({
+    Name = "Tempo de espera do usuário em resposta errada",
+    PlaceholderText = settings.userCooldown,
+    Callback = function(value)
+        if value and tonumber(value) then
+            settings.userCooldown = tonumber(value)
+        end
+    end
+})
+
+settingsTab:CreateSection("Configurações de placar")
+
+settingsTab:CreateToggle({
+    Name = "Remover jogadores que saíram do placar",
+    CurrentValue = settings.removeLeavingPlayersFromLB,
+    Callback = function(value)
+        settings.removeLeavingPlayersFromLB = value
+    end
+})
+settingsTab:CreateInput({
+    Name = "Enviar placar do quiz atual a cada X perguntas",
+    PlaceholderText = settings.sendLeaderBoardAfterQuestions,
+    Callback = function(value)
+        if value and tonumber(value) then
+            settings.sendLeaderBoardAfterQuestions = tonumber(value)
+            if not settings.automaticCurrentQuizLeaderboard then
+                notify("Placar do quiz atual desativado", "Esta configuração não tem efeito enquanto o envio automático do placar do quiz atual estiver desativado")
+            end
+        end
+    end
+})
+
+settingsTab:CreateDivider()
+local disableBothLeaderboardsToggle, disableCurrentLeaderboardToggle, disableServerLeaderboardToggle
+local originalSettings: { boolean } = {not settings.automaticCurrentQuizLeaderboard, not settings.automaticServerQuizLeaderboard}
+disableBothLeaderboardsToggle = settingsTab:CreateToggle({
+    Name = "Desativar envio automático de ambos os placares",
+    CurrentValue = not settings.automaticLeaderboards,
+    Callback = function(value)
+        settings.automaticLeaderboards = not value
+        if value then
+            originalSettings = {not settings.automaticCurrentQuizLeaderboard, not settings.automaticServerQuizLeaderboard}
+            disableCurrentLeaderboardToggle:Set(true)
+            disableServerLeaderboardToggle:Set(true)
+        else
+            disableCurrentLeaderboardToggle:Set(originalSettings[1])
+            disableServerLeaderboardToggle:Set(originalSettings[2])
+        end
+    end
+})
+disableCurrentLeaderboardToggle = settingsTab:CreateToggle({
+    Name = "Desativar envio automático do placar do quiz atual",
+    CurrentValue = not settings.automaticCurrentQuizLeaderboard or not settings.automaticLeaderboards,
+    Callback = function(value)
+        if value == false and settings.automaticLeaderboards == false then
+            originalSettings = {false, not settings.automaticServerQuizLeaderboard}
+            settings.automaticLeaderboards = true
+            disableBothLeaderboardsToggle:Set(false)
+        end
+        settings.automaticCurrentQuizLeaderboard = not value
+    end
+})
+disableServerLeaderboardToggle = settingsTab:CreateToggle({
+    Name = "Desativar envio automático do placar do servidor",
+    CurrentValue = not settings.automaticServerQuizLeaderboard or not settings.automaticLeaderboards,
+    Callback = function(value)
+        if value == false and settings.automaticLeaderboards == false then
+            originalSettings = {not settings.automaticCurrentQuizLeaderboard, false}
+            settings.automaticLeaderboards = true
+            disableBothLeaderboardsToggle:Set(false)
+        end
+        settings.automaticServerQuizLeaderboard = not value
+    end
+})
+
+local originalDoNotRepeatState = not settings.repeatTagged
+local doNotRepeatTaggedToggle
+local originalFullModeState = settings.boothGameFullMode
+local fullModeToggle
+if boothGame then
+    settingsTab:CreateSection("Configurações do jogo de cabine")
+    settingsTab:CreateToggle({
+        Name = "Ativar status da placa (requer item de placa)",
+        CurrentValue = settings.signStatus,
+        Callback = function(value)
+            settings.signStatus = value
+        end
+    })
+    settingsTab:CreateToggle({
+        Name = "Ativar status da cabine (deve possuir uma cabine)",
+        CurrentValue = settings.boothStatus,
+        Callback = function(value)
+            settings.boothStatus = value
+            if not value and originalBoothText ~= "" then
+                UpdateBoothText(originalBoothText)
+            end
+        end
+    })
+    settingsTab:CreateToggle({
+        Name = "Não enviar mensagens do quiz no chat",
+        CurrentValue = settings.disableChat,
+        Callback = function(value)
+            settings.disableChat = value
+            if value then
+                originalDoNotRepeatState = not settings.repeatTagged
+                doNotRepeatTaggedToggle:Set(true)
+                originalFullModeState = settings.boothGameFullMode
+                fullModeToggle:Set(true)
+            else
+                doNotRepeatTaggedToggle:Set(originalDoNotRepeatState)
+                fullModeToggle:Set(originalFullModeState)
+            end
+        end
+    })
+    fullModeToggle = settingsTab:CreateToggle({
+        Name = "Listar opções de resposta na placa e na cabine",
+        CurrentValue = settings.boothGameFullMode,
+        Callback = function(value)
+            if not value and settings.disableChat then
+                notify("Não é possível alterar a configuração", 'Esta configuração não pode ser alterada enquanto a configuração "não enviar mensagens do quiz no chat" estiver ativada')
+                fullModeToggle:Set(true)
+                return
+            end
+            settings.boothGameFullMode = value
+        end
+    })
+    settingsTab:CreateToggle({
+        Name = "Usar números romanos para o cronômetro da placa para contornar a filtragem",
+        CurrentValue = settings.romanNumbers,
+        Callback = function(value)
+            settings.romanNumbers = value
+        end
+    })
+    settingsTab:CreateToggle({
+        Name = "Desativar notificações push enquanto um quiz está em andamento",
+        CurrentValue = settings.boothGameSuppressNotifs,
+        Callback = function(value)
+            if not value then
+                SuppressBoothGameNotifications(false)
+            end
+            settings.boothGameSuppressNotifs = value
+        end
+    })
+end
+
+settingsTab:CreateSection("Configurações diversas")
+doNotRepeatTaggedToggle = settingsTab:CreateToggle({
+    Name = "Não repetir mensagens marcadas",
+    CurrentValue = not settings.repeatTagged,
+    Callback = function(value)
+        if not value and settings.disableChat then
+            notify("Não é possível alterar a configuração", 'Esta configuração não pode ser alterada enquanto a configuração "não enviar mensagens do quiz no chat" estiver ativada')
+            doNotRepeatTaggedToggle:Set(true)
+            return
+        end
+        settings.repeatTagged = not value
+        messageFiltered = false
+    end
+})
+settingsTab:CreateToggle({
+    Name = "Enviar lista detalhada de categorias no chat (pode ser marcada)",
+    CurrentValue = settings.sendDetailedCategorylist,
+    Callback = function(value)
+        settings.sendDetailedCategorylist = value
+    end
+})
+
+if outdated then
+    settingsTab:CreateToggle({
+        Name = "Desativar alertas de versão desatualizada",
+        CurrentValue = getDataFileValue("disableVersionAlert"),
+        Callback = function(value)
+            writeToDataFile("disableVersionAlert", value)
+        end
+    })
+end
+
+settingsTab:CreateSection("Desativar script")
+settingsTab:CreateButton({
+    Name = "Destruir UI e desativar script",
+    Callback = function()
+        chatConnection:Disconnect()
+        quizCooldown = true
+        quizRunning = false
+        currentQuestion = nil
+        questionAnsweredBy = nil
+        awaitingAnswer = false
+        ContextActionService:UnbindAction("ToggleUI")
+        library:Destroy()
+        setgenv("QUIZBOT_RUNNING", false)
+    end
+})
+
+return CustomCategoryManager
